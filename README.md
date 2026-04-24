@@ -261,7 +261,7 @@ python benchmarks/bench_speculative.py \
 
 Prints per-step tokens and implied acceptance rate α. Code prompts (the
 default set) give α ≈ 0.6–0.7 with a reasonable draft; natural language
-typically lands lower.
+typically lands lower
 
 ### GPTQ perplexity
 
