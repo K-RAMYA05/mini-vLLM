@@ -1,0 +1,17 @@
+# Example: 8B A100/H100 throughput run.
+# Run:
+#   python benchmarks/bench_throughput.py \
+#     --model meta-llama/Llama-3.1-8B \
+#     --dtype bfloat16 \
+#     --batch-size 32 --num-prompts 128 --prompt-len 512 --max-tokens 128 \
+#     --block-size 16 --num-gpu-blocks 8192 --prefill-backend flash
+model: meta-llama/Llama-3.1-8B
+dtype: bfloat16
+batch_size: 32
+num_prompts: 128
+prompt_len: 512
+max_tokens: 128
+block_size: 16
+num_gpu_blocks: 8192
+prefill_backend: flash
+use_triton_attention: true

@@ -1,0 +1,11 @@
+torch>=2.1.0
+triton>=2.1.0
+transformers>=4.40.0
+tokenizers>=0.15.0
+numpy
+datasets          # for bench_gptq.py
+scipy             # for bench_speculative.py (acceptance rate solver)
+pytest            # for tests
+fastapi           # for OpenAI-compatible server
+uvicorn[standard] # for OpenAI-compatible server
+pydantic          # request/response models
