@@ -9,7 +9,7 @@ from mini_vllm.sequence import Sequence, SequenceStatus
 
 
 def _make_scheduler(**kwargs) -> Scheduler:
-    cfg = EngineConfig(
+    defaults = dict(
         block_size=4,
         num_gpu_blocks=8,
         max_num_seqs=4,
@@ -17,8 +17,9 @@ def _make_scheduler(**kwargs) -> Scheduler:
         max_model_len=64,
         enable_prefix_cache=True,
         prefix_cache_max_entries=32,
-        **kwargs,
     )
+    defaults.update(kwargs)
+    cfg = EngineConfig(**defaults)
     cache = KVCache(
         num_layers=1,
         num_kv_heads=1,

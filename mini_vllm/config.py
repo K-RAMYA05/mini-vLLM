@@ -65,11 +65,11 @@ class EngineConfig:
     def __post_init__(self) -> None:
         if self.use_speculative and self.draft_model_name_or_path is None:
             raise ValueError("draft_model_name_or_path required when use_speculative=True")
-        if self.block_size not in (8, 16, 32):
+        if self.block_size not in (4, 8, 16, 32):
             # The Triton kernel is written assuming power-of-two block sizes
-            # that fit nicely in a warp. Other sizes will work but haven't
-            # been tuned.
-            raise ValueError(f"block_size must be one of 8, 16, 32 (got {self.block_size})")
+            # that fit nicely in a warp. 4 is allowed for tests/small-batch
+            # sanity runs; 8/16/32 are the tuned production sizes.
+            raise ValueError(f"block_size must be one of 4, 8, 16, 32 (got {self.block_size})")
         if self.quant_bits not in (4, 8):
             raise ValueError(f"quant_bits must be 4 or 8 (got {self.quant_bits})")
         if self.quant_group_size <= 0:

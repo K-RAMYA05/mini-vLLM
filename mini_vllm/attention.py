@@ -313,16 +313,46 @@ def _flash3_attention(
     return out.transpose(1, 2)
 
 
+def _flash2_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Run FlashAttention-2 via the `flash_attn` package (Ampere, A100)."""
+    if not q.is_cuda:
+        raise RuntimeError("flash-attn backend requires CUDA tensors")
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError as exc:
+        raise RuntimeError(
+            "flash-attn backend requires the `flash-attn` package "
+            "(install with: pip install flash-attn --no-build-isolation)"
+        ) from exc
+    out = flash_attn_func(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        causal=True,
+        softmax_scale=scale,
+    )
+    return out.transpose(1, 2)
+
+
 def _should_prefer_flash3(q: torch.Tensor) -> bool:
+    """True when device is Hopper (SM90+). Does not check package install;
+    _flash3_attention will raise with a clear message if it's missing."""
     if not q.is_cuda:
         return False
-    if torch.cuda.get_device_capability(q.device)[0] < 9:
+    return torch.cuda.get_device_capability(q.device)[0] >= 9
+
+
+def _should_prefer_flash2(q: torch.Tensor) -> bool:
+    """True when device is Ampere (SM80/SM86) — below Hopper."""
+    if not q.is_cuda:
         return False
-    try:
-        import flash_attn_interface  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    major = torch.cuda.get_device_capability(q.device)[0]
+    return 8 <= major < 9
 
 
 def _attention_prefill(
@@ -332,31 +362,34 @@ def _attention_prefill(
     scale: float,
     backend: str,
 ) -> torch.Tensor:
-    """Run causal prefill attention with either flash-attn or PyTorch SDPA.
+    """Run causal prefill attention with flash-attn (v2/v3) or PyTorch SDPA.
 
     q/k/v use PyTorch SDPA layout [B, H, T, D]. The flash-attn package uses
     [B, T, H, D], so this wrapper keeps the call sites backend-agnostic.
+
+    Strict device routing (no silent fallback):
+      - 'flash3'    : FA3, Hopper only.
+      - 'flash_attn': FA2 via `flash_attn` package.
+      - 'flash'     : FA3 on Hopper, FA2 on Ampere; raises on other CUDA devices.
+      - 'auto'      : same as 'flash' on CUDA; falls back to SDPA on CPU.
+      - other       : PyTorch SDPA with the requested kernel.
     """
     if backend == "flash3":
         return _flash3_attention(q, k, v, scale)
-    if backend == "flash" and _should_prefer_flash3(q):
-        return _flash3_attention(q, k, v, scale)
-
     if backend == "flash_attn":
-        try:
-            from flash_attn import flash_attn_func
-        except ImportError as exc:
+        return _flash2_attention(q, k, v, scale)
+
+    if backend in ("flash", "auto"):
+        if _should_prefer_flash3(q):
+            return _flash3_attention(q, k, v, scale)
+        if _should_prefer_flash2(q):
+            return _flash2_attention(q, k, v, scale)
+        if backend == "flash":
             raise RuntimeError(
-                "prefill_attention_backend='flash_attn' requires the flash-attn package"
-            ) from exc
-        out = flash_attn_func(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            causal=True,
-            softmax_scale=scale,
-        )
-        return out.transpose(1, 2)
+                "prefill_attention_backend='flash' requires an SM80+ CUDA GPU "
+                "(A100 for FA2, H100 for FA3). Use 'math' or 'mem_efficient' "
+                "for CPU / pre-Ampere devices."
+            )
 
     with _sdpa_backend(backend):
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
