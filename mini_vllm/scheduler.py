@@ -27,6 +27,7 @@ from typing import List, Tuple
 
 from mini_vllm.block_manager import KVCache
 from mini_vllm.config import EngineConfig
+from mini_vllm.prefix_cache import PrefixCache
 from mini_vllm.sequence import Sequence, SequenceStatus
 
 
@@ -54,6 +55,11 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.swapped: deque[Sequence] = deque()
         self.running: List[Sequence] = []
+        self.prefix_cache = (
+            PrefixCache(kv_cache, config.block_size, config.prefix_cache_max_entries)
+            if config.enable_prefix_cache
+            else None
+        )
 
     # ---------- admission ----------
 
@@ -143,18 +149,33 @@ class Scheduler:
                 continue
             if prompt_len > token_budget:
                 break
+            cached_blocks = []
+            cached_tokens = 0
+            if self.prefix_cache is not None:
+                cached_blocks, cached_tokens = self.prefix_cache.lookup(seq.prompt_token_ids)
+                if self.metrics is not None:
+                    self.metrics.observe_prefix_cache(cached_tokens)
+            uncached_tokens = prompt_len - cached_tokens
+            if uncached_tokens > token_budget:
+                break
             blocks_needed = self.kv_cache.num_blocks_needed(prompt_len)
-            if not self.kv_cache.allocator.can_allocate(blocks_needed):
+            blocks_to_allocate = blocks_needed - len(cached_blocks)
+            if not self.kv_cache.allocator.can_allocate(blocks_to_allocate):
                 break
 
             # Commit.
             self.waiting.popleft()
-            for _ in range(blocks_needed):
+            if cached_blocks:
+                self.kv_cache.retain_blocks(cached_blocks)
+                seq.block_table.physical_blocks.extend(cached_blocks)
+                seq.num_cached_tokens = cached_tokens
+                seq.prefix_cache_blocks = len(cached_blocks)
+            for _ in range(blocks_to_allocate):
                 seq.block_table.append(self.kv_cache.allocator.allocate())
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             prefill.append(seq)
-            token_budget -= prompt_len
+            token_budget -= uncached_tokens
             seq_budget -= 1
 
         return SchedulerOutputs(prefill_seqs=prefill, decode_seqs=decode)
@@ -167,12 +188,17 @@ class Scheduler:
         still: List[Sequence] = []
         for seq in self.running:
             if seq.status.is_finished:
+                self._register_prefix_cache(seq)
                 self._free(seq)
                 finished.append(seq)
             else:
                 still.append(seq)
         self.running = still
         return finished
+
+    def register_prefill_cache(self, seqs: List[Sequence]) -> None:
+        for seq in seqs:
+            self._register_prefix_cache(seq)
 
     # ---------- internals ----------
 
@@ -201,6 +227,12 @@ class Scheduler:
             else:
                 self.kv_cache.allocator.free_many(seq.block_table.as_list())
             seq.block_table.physical_blocks.clear()
+            seq.prefix_cache_blocks = 0
+
+    def _register_prefix_cache(self, seq: Sequence) -> None:
+        if self.prefix_cache is None or len(seq.block_table) == 0:
+            return
+        self.prefix_cache.register(seq.prompt_token_ids, seq.block_table.as_list())
 
     @property
     def has_work(self) -> bool:

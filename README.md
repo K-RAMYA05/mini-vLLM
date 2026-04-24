@@ -90,12 +90,25 @@ optionally samples a bonus.
 
 ### FlashAttention-backed prefill
 
-Prefill uses PyTorch `scaled_dot_product_attention`, which dispatches to
-FlashAttention on supported CUDA builds. Set
-`prefill_attention_backend="flash"` to require PyTorch's FlashAttention SDPA
-backend, `prefill_attention_backend="flash_attn"` to call the external
-`flash-attn` CUDA extension directly, or leave it at `"auto"` to let PyTorch
-choose among flash, memory-efficient, and math backends.
+Prefill uses PyTorch `scaled_dot_product_attention`, FlashAttention-3 on
+Hopper when available, or the external `flash-attn` extension. Set
+`prefill_attention_backend="flash3"` on H100/H800 to force the official
+FlashAttention-3 hopper package (`import flash_attn_interface`). If you keep
+`prefill_attention_backend="flash"`, mini-vLLM now prefers FlashAttention-3
+automatically on Hopper when that package is installed; otherwise it uses
+PyTorch's FlashAttention SDPA backend. Set `prefill_attention_backend="flash_attn"`
+to call the external FlashAttention-2 style `flash-attn` CUDA extension
+directly, or leave it at `"auto"` to let PyTorch choose among flash,
+memory-efficient, and math backends.
+
+### Prefix caching
+
+Prefix caching is now available via `enable_prefix_cache=True`. The engine
+stores reusable prompt KV blocks by cumulative prefix digest and reuses those
+blocks for later requests that share the same full-block prompt prefix. The
+current implementation reuses prompt prefixes at block granularity and
+recomputes the remaining suffix tokens normally, which makes cache-hit
+benchmarks straightforward without changing the decode kernel.
 
 ### Data-parallel serving
 
@@ -160,6 +173,14 @@ pip install -e .
 
 Requires CUDA + Triton for the kernel path. On CPU or non-CUDA GPUs the
 engine falls back to the reference attention implementation (slow, correct).
+For H100/H800, install the FlashAttention-3 hopper package if you want the
+`flash3` prefill backend:
+
+```bash
+git clone https://github.com/Dao-AILab/flash-attention
+cd flash-attention/hopper
+python setup.py install
+```
 
 ## Quick start
 
@@ -193,7 +214,7 @@ python -m mini_vllm.entrypoints.openai_server \
     --model meta-llama/Llama-3.1-8B \
     --dtype bfloat16 \
     --num-gpu-blocks 8192 \
-    --prefill-backend flash \
+    --prefill-backend flash3 \
     --host 0.0.0.0 \
     --port 8000
 ```
@@ -232,7 +253,7 @@ python benchmarks/bench_throughput.py \
     --batch-size 32 --num-prompts 128 \
     --prompt-len 512 --max-tokens 128 \
     --block-size 16 --num-gpu-blocks 8192 \
-    --prefill-backend flash
+    --prefill-backend flash3
 ```
 
 Expected: mini-vLLM wins because HF does static batching (pads every
@@ -291,6 +312,22 @@ python benchmarks/stress_long_run.py \
     --num-gpu-blocks 8192 \
     --prefill-backend flash
 ```
+
+### Prefix-cache benchmark
+
+```bash
+python benchmarks/bench_prefix_cache.py \
+    --model meta-llama/Llama-3.1-8B \
+    --dtype bfloat16 \
+    --batch-size 32 --num-prompts 33 \
+    --prefix-len 256 --suffix-len 32 --max-tokens 64 \
+    --block-size 16 --num-gpu-blocks 8192 \
+    --prefill-backend flash3
+```
+
+This runs the same shared-prefix workload twice, first with prefix caching
+disabled and then with it enabled, and prints the cache-hit counts and
+throughput difference.
 
 ## Tests
 

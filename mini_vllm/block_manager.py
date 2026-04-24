@@ -64,6 +64,7 @@ class BlockAllocator:
         # which tends to be friendlier to L2 cache than LIFO.
         self._free: deque[int] = deque(range(num_blocks))
         self._allocated: int = 0
+        self._refcounts: List[int] = [0] * num_blocks
 
     def allocate(self) -> int:
         if not self._free:
@@ -74,16 +75,25 @@ class BlockAllocator:
             )
         block_id = self._free.popleft()
         self._allocated += 1
+        self._refcounts[block_id] = 1
         return block_id
 
+    def retain(self, block_id: int) -> None:
+        if self._refcounts[block_id] <= 0:
+            raise RuntimeError(f"Cannot retain free block {block_id}")
+        self._refcounts[block_id] += 1
+
     def free(self, block_id: int) -> None:
-        self._free.append(block_id)
-        self._allocated -= 1
+        if self._refcounts[block_id] <= 0:
+            raise RuntimeError(f"Double free of block {block_id}")
+        self._refcounts[block_id] -= 1
+        if self._refcounts[block_id] == 0:
+            self._free.append(block_id)
+            self._allocated -= 1
 
     def free_many(self, block_ids: List[int]) -> None:
         for b in block_ids:
-            self._free.append(b)
-        self._allocated -= len(block_ids)
+            self.free(b)
 
     @property
     def num_free(self) -> int:
@@ -95,6 +105,9 @@ class BlockAllocator:
 
     def can_allocate(self, n: int) -> bool:
         return len(self._free) >= n
+
+    def refcount(self, block_id: int) -> int:
+        return self._refcounts[block_id]
 
 
 class KVCache:
@@ -179,6 +192,29 @@ class KVCache:
 
     def get_kv_tensors(self, layer_idx: int):
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def retain_blocks(self, block_ids: List[int]) -> None:
+        for block_id in block_ids:
+            self.allocator.retain(block_id)
+
+    def read_tokens(
+        self,
+        layer_idx: int,
+        block_table: BlockTable,
+        end_pos: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather logical token positions [0, end_pos) into dense K/V tensors."""
+        keys = torch.empty(
+            (end_pos, self.num_kv_heads, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        values = torch.empty_like(keys)
+        for pos in range(end_pos):
+            block_id, offset = self.logical_to_physical(block_table, pos)
+            keys[pos] = self.key_cache[layer_idx, block_id, :, offset, :]
+            values[pos] = self.value_cache[layer_idx, block_id, :, offset, :]
+        return keys, values
 
     # ----- CPU swap path -----
 

@@ -113,7 +113,7 @@ class PagedAttention(nn.Module):
                 kv_cache.write_prefill(
                     self.layer_idx,
                     seq_info.block_table,
-                    start_pos=write_offset,
+                    start_pos=seq_info.start_pos + write_offset,
                     keys=k_pre[s:e],
                     values=v_pre[s:e],
                 )
@@ -132,10 +132,28 @@ class PagedAttention(nn.Module):
                 if group > 1:
                     ks = ks.repeat_interleave(group, dim=0)
                     vs = vs.repeat_interleave(group, dim=0)
-                attn_out = _attention_prefill(
-                    qs.unsqueeze(0), ks.unsqueeze(0), vs.unsqueeze(0),
-                    self.scale, self.prefill_backend,
-                )
+                prefix_len = seq_info.start_pos + write_offset
+                if prefix_len > 0:
+                    prefix_k, prefix_v = kv_cache.read_tokens(
+                        self.layer_idx, seq_info.block_table, prefix_len
+                    )
+                    prefix_k = prefix_k.transpose(0, 1)
+                    prefix_v = prefix_v.transpose(0, 1)
+                    if group > 1:
+                        prefix_k = prefix_k.repeat_interleave(group, dim=0)
+                        prefix_v = prefix_v.repeat_interleave(group, dim=0)
+                    attn_out = _attention_prefill_with_prefix(
+                        qs.unsqueeze(0),
+                        torch.cat([prefix_k, ks], dim=1).unsqueeze(0),
+                        torch.cat([prefix_v, vs], dim=1).unsqueeze(0),
+                        prefix_len=prefix_len,
+                        scale=self.scale,
+                    )
+                else:
+                    attn_out = _attention_prefill(
+                        qs.unsqueeze(0), ks.unsqueeze(0), vs.unsqueeze(0),
+                        self.scale, self.prefill_backend,
+                    )
                 out_prefill[s:e] = attn_out.squeeze(0).transpose(0, 1)
             outputs.append(out_prefill)
 
@@ -264,6 +282,49 @@ def _sdpa_backend(backend: str):
     return sdpa_kernel(selected)
 
 
+def _flash3_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Run FlashAttention-3 on Hopper GPUs via the external hopper package."""
+    if not q.is_cuda:
+        raise RuntimeError("prefill_attention_backend='flash3' requires CUDA tensors")
+    if torch.cuda.get_device_capability(q.device)[0] < 9:
+        raise RuntimeError(
+            "prefill_attention_backend='flash3' requires Hopper-class GPUs (SM90+, e.g. H100/H800)"
+        )
+    try:
+        import flash_attn_interface
+    except ImportError as exc:
+        raise RuntimeError(
+            "prefill_attention_backend='flash3' requires the FlashAttention-3 hopper package "
+            "(install from flash-attention/hopper so `import flash_attn_interface` works)"
+        ) from exc
+
+    out = flash_attn_interface.flash_attn_func(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        softmax_scale=scale,
+        causal=True,
+    )
+    return out.transpose(1, 2)
+
+
+def _should_prefer_flash3(q: torch.Tensor) -> bool:
+    if not q.is_cuda:
+        return False
+    if torch.cuda.get_device_capability(q.device)[0] < 9:
+        return False
+    try:
+        import flash_attn_interface  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _attention_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -276,6 +337,11 @@ def _attention_prefill(
     q/k/v use PyTorch SDPA layout [B, H, T, D]. The flash-attn package uses
     [B, T, H, D], so this wrapper keeps the call sites backend-agnostic.
     """
+    if backend == "flash3":
+        return _flash3_attention(q, k, v, scale)
+    if backend == "flash" and _should_prefer_flash3(q):
+        return _flash3_attention(q, k, v, scale)
+
     if backend == "flash_attn":
         try:
             from flash_attn import flash_attn_func
@@ -294,3 +360,19 @@ def _attention_prefill(
 
     with _sdpa_backend(backend):
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+
+
+def _attention_prefill_with_prefix(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    prefix_len: int,
+    scale: float,
+) -> torch.Tensor:
+    """Run prefill attention when the sequence already has cached prefix KV."""
+    _, _, q_len, _ = q.shape
+    total_k = k.shape[2]
+    mask = torch.full((q_len, total_k), float("-inf"), dtype=q.dtype, device=q.device)
+    for row in range(q_len):
+        mask[row, : prefix_len + row + 1] = 0
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False, scale=scale)

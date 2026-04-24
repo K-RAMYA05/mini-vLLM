@@ -139,7 +139,7 @@ def main():
     p.add_argument(
         "--prefill-backend",
         default="auto",
-        choices=["auto", "flash", "flash_attn", "mem_efficient", "math"],
+        choices=["auto", "flash", "flash3", "flash_attn", "mem_efficient", "math"],
     )
     p.add_argument("--no-triton", action="store_true")
     p.add_argument("--skip-hf", action="store_true")

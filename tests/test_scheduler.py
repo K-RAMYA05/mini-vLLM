@@ -119,3 +119,8 @@ def test_scheduler_swaps_instead_of_aborting_on_decode_oom():
     assert seq.status == SequenceStatus.SWAPPED
     assert list(sched.swapped) == [seq]
     assert sched.kv_cache.allocator.num_free == 1
+
+
+def test_engine_config_accepts_prefix_cache():
+    cfg = EngineConfig(enable_prefix_cache=True, prefix_cache_max_entries=16)
+    assert cfg.enable_prefix_cache is True

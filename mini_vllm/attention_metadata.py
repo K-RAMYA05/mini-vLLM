@@ -17,6 +17,7 @@ from mini_vllm.block_manager import BlockTable
 class PrefillSeqInfo:
     block_table: BlockTable
     token_range: Tuple[int, int]      # [start, end) in the packed hidden_states
+    start_pos: int = 0
 
 
 @dataclass

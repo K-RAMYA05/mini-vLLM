@@ -50,6 +50,7 @@ class Sequence:
     # this jumps from 0 to len(prompt); during decode it increments by 1
     # (or by the number of accepted draft tokens under speculative decoding).
     num_cached_tokens: int = 0
+    prefix_cache_blocks: int = 0
 
     # Filled in when the sequence finishes.
     finish_reason: Optional[str] = None

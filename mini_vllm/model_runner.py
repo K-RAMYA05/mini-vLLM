@@ -69,17 +69,20 @@ class ModelRunner:
         prefill_infos: List[PrefillSeqInfo] = []
         cursor = 0
         for seq in prefill_seqs:
-            toks = seq.all_token_ids  # includes any previously-generated tokens? no — prefill runs once per seq
+            toks = seq.prompt_token_ids[seq.num_cached_tokens:]
             n = len(toks)
             input_ids_list.extend(toks)
-            position_ids_list.extend(range(n))
+            position_ids_list.extend(range(seq.num_cached_tokens, seq.num_cached_tokens + n))
             prefill_infos.append(
-                PrefillSeqInfo(block_table=seq.block_table, token_range=(cursor, cursor + n))
+                PrefillSeqInfo(
+                    block_table=seq.block_table,
+                    token_range=(cursor, cursor + n),
+                    start_pos=seq.num_cached_tokens,
+                )
             )
             cursor += n
             sampling_token_indices.append(cursor - 1)
-            # After prefill, seq has all its prompt tokens cached.
-            seq.num_cached_tokens = n
+            seq.num_cached_tokens += n
         num_prefill_tokens = cursor
 
         decode_infos: List[DecodeSeqInfo] = []

@@ -35,6 +35,7 @@ class EngineConfig:
     enable_chunked_prefill: bool = False
     max_prefill_chunk_tokens: int = 2048
     enable_prefix_cache: bool = False
+    prefix_cache_max_entries: int = 16384
 
     # ---- Multi-GPU placeholders ----
     # Real TP/PP requires sharded weight loading, distributed collectives, and
@@ -55,7 +56,7 @@ class EngineConfig:
 
     # ---- Kernels ----
     use_triton_attention: bool = True       # False -> fallback reference kernel
-    prefill_attention_backend: str = "auto" # auto | flash | flash_attn | mem_efficient | math
+    prefill_attention_backend: str = "auto" # auto | flash | flash3 | flash_attn | mem_efficient | math
 
     # ---- Misc ----
     seed: int = 0
@@ -73,14 +74,21 @@ class EngineConfig:
             raise ValueError(f"quant_bits must be 4 or 8 (got {self.quant_bits})")
         if self.quant_group_size <= 0:
             raise ValueError("quant_group_size must be positive")
-        if self.prefill_attention_backend not in ("auto", "flash", "flash_attn", "mem_efficient", "math"):
+        if self.prefill_attention_backend not in (
+            "auto",
+            "flash",
+            "flash3",
+            "flash_attn",
+            "mem_efficient",
+            "math",
+        ):
             raise ValueError(
                 "prefill_attention_backend must be one of "
-                "auto, flash, flash_attn, mem_efficient, math"
+                "auto, flash, flash3, flash_attn, mem_efficient, math"
             )
         if self.tensor_parallel_size < 1 or self.pipeline_parallel_size < 1:
             raise ValueError("parallel sizes must be >= 1")
         if self.enable_chunked_prefill:
             raise NotImplementedError("chunked prefill is not implemented yet")
-        if self.enable_prefix_cache:
-            raise NotImplementedError("prefix caching is not implemented yet")
+        if self.prefix_cache_max_entries < 0:
+            raise ValueError("prefix_cache_max_entries must be >= 0")

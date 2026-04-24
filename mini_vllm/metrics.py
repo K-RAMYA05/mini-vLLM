@@ -17,6 +17,9 @@ class EngineMetrics:
     decode_tokens: int = 0
     swap_out_count: int = 0
     swap_in_count: int = 0
+    prefix_cache_queries: int = 0
+    prefix_cache_hits: int = 0
+    prefix_cache_hit_tokens: int = 0
     total_time_to_first_token_s: float = 0.0
     total_inter_token_latency_s: float = 0.0
     inter_token_latency_count: int = 0
@@ -43,6 +46,12 @@ class EngineMetrics:
             self.total_inter_token_latency_s += itl_s
             self.inter_token_latency_count += 1
 
+    def observe_prefix_cache(self, hit_tokens: int) -> None:
+        self.prefix_cache_queries += 1
+        if hit_tokens > 0:
+            self.prefix_cache_hits += 1
+            self.prefix_cache_hit_tokens += hit_tokens
+
     def snapshot(self, kv_cache=None, scheduler=None) -> Dict[str, float | int]:
         elapsed = max(time.perf_counter() - self.start_time_s, 1e-9)
         out: Dict[str, float | int] = {
@@ -57,6 +66,9 @@ class EngineMetrics:
             "decode_tokens": self.decode_tokens,
             "swap_out_count": self.swap_out_count,
             "swap_in_count": self.swap_in_count,
+            "prefix_cache_queries": self.prefix_cache_queries,
+            "prefix_cache_hits": self.prefix_cache_hits,
+            "prefix_cache_hit_tokens": self.prefix_cache_hit_tokens,
             "avg_ttft_s": self.total_time_to_first_token_s / max(self.requests_started, 1),
             "avg_itl_s": self.total_inter_token_latency_s / max(self.inter_token_latency_count, 1),
         }
@@ -75,6 +87,8 @@ class EngineMetrics:
                 "running_requests": len(scheduler.running),
                 "swapped_requests": len(scheduler.swapped),
             })
+            if getattr(scheduler, "prefix_cache", None) is not None:
+                out["prefix_cache_entries"] = scheduler.prefix_cache.num_entries
         return out
 
     def prometheus(self, kv_cache=None, scheduler=None) -> str:

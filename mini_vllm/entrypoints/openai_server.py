@@ -248,6 +248,7 @@ def build_engine_from_args(args) -> LLMEngine:
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
+        enable_prefix_cache=args.enable_prefix_cache,
         prefill_attention_backend=args.prefill_backend,
         use_triton_attention=not args.no_triton,
         trust_remote_code=args.trust_remote_code,
@@ -268,7 +269,12 @@ def main() -> None:
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--prefill-backend", default="flash", choices=["auto", "flash", "flash_attn", "mem_efficient", "math"])
+    parser.add_argument("--enable-prefix-cache", action="store_true")
+    parser.add_argument(
+        "--prefill-backend",
+        default="flash",
+        choices=["auto", "flash", "flash3", "flash_attn", "mem_efficient", "math"],
+    )
     parser.add_argument("--no-triton", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()

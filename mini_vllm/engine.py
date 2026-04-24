@@ -151,6 +151,8 @@ class LLMEngine:
                 self._observe_generated_token(seq)
                 seq.check_stop(self.info["eos_token_id"])
 
+        self.scheduler.register_prefill_cache(outputs.prefill_seqs)
+
         # Collect any sequences that finished this step.
         finished = self.scheduler.finalize_finished()
         results = [self._build_output(s) for s in finished]
