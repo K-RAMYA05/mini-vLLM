@@ -131,6 +131,7 @@ class KVCache:
         dtype: torch.dtype,
         device: torch.device | str,
         num_cpu_blocks: int = 0,
+        kv_cache_dtype: str = "auto",
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -138,14 +139,27 @@ class KVCache:
         self.num_blocks = num_blocks
         self.num_cpu_blocks = num_cpu_blocks
         self.block_size = block_size
-        self.dtype = dtype
+        self.dtype = dtype                         # compute / scale dtype
         self.device = torch.device(device)
+        self.kv_cache_dtype = kv_cache_dtype       # 'auto' | 'int8'
+        self.is_int8 = kv_cache_dtype == "int8"
 
         shape = (num_layers, num_blocks, num_kv_heads, block_size, head_dim)
+        store_dtype = torch.int8 if self.is_int8 else dtype
         # Empty is fine — cells are written before they're read (we always
         # append to the current position, we never read ahead of it).
-        self.key_cache = torch.empty(shape, dtype=dtype, device=self.device)
-        self.value_cache = torch.empty(shape, dtype=dtype, device=self.device)
+        self.key_cache = torch.empty(shape, dtype=store_dtype, device=self.device)
+        self.value_cache = torch.empty(shape, dtype=store_dtype, device=self.device)
+        # Per-(layer, block, kv_head, slot) scale, fp16/bf16. Only allocated
+        # under int8. Per-token (per-slot) scales avoid the re-quantization
+        # bookkeeping that per-block scales would need on subsequent writes.
+        if self.is_int8:
+            scale_shape = (num_layers, num_blocks, num_kv_heads, block_size)
+            self.key_scales = torch.empty(scale_shape, dtype=dtype, device=self.device)
+            self.value_scales = torch.empty(scale_shape, dtype=dtype, device=self.device)
+        else:
+            self.key_scales = None
+            self.value_scales = None
 
         self.allocator = BlockAllocator(num_blocks)
         self.cpu_allocator = BlockAllocator(num_cpu_blocks) if num_cpu_blocks > 0 else None
@@ -180,10 +194,32 @@ class KVCache:
         """Scatter a contiguous run of new tokens into the paged cache.
 
         Used during prefill (many tokens at once) and also fine for decode
-        (one token). For decode we could specialize to skip the loop, but
-        decode calls this with num_new_tokens=1 so the overhead is tiny.
+        (one token). Under kv_cache_dtype='int8' we quantize per-(token, head)
+        with a symmetric scale = absmax / 127.
         """
         num_new = keys.shape[0]
+        if self.is_int8:
+            # Vectorized: per-(token, head) absmax across head_dim.
+            k_absmax = keys.abs().amax(dim=-1).clamp_min(1e-8)   # [N, H]
+            v_absmax = values.abs().amax(dim=-1).clamp_min(1e-8)
+            k_scales = (k_absmax / 127.0).to(self.dtype)         # [N, H]
+            v_scales = (v_absmax / 127.0).to(self.dtype)
+            qk = (
+                (keys / k_scales.to(keys.dtype).unsqueeze(-1))
+                .round().clamp(-128, 127).to(torch.int8)
+            )                                                    # [N, H, D]
+            qv = (
+                (values / v_scales.to(values.dtype).unsqueeze(-1))
+                .round().clamp(-128, 127).to(torch.int8)
+            )
+            for i in range(num_new):
+                pos = start_pos + i
+                block_id, offset = self.logical_to_physical(block_table, pos)
+                self.key_cache[layer_idx, block_id, :, offset, :] = qk[i]
+                self.value_cache[layer_idx, block_id, :, offset, :] = qv[i]
+                self.key_scales[layer_idx, block_id, :, offset] = k_scales[i]
+                self.value_scales[layer_idx, block_id, :, offset] = v_scales[i]
+            return
         for i in range(num_new):
             pos = start_pos + i
             block_id, offset = self.logical_to_physical(block_table, pos)
@@ -192,6 +228,12 @@ class KVCache:
 
     def get_kv_tensors(self, layer_idx: int):
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def get_kv_scales(self, layer_idx: int):
+        """Return per-layer (key_scales, value_scales) or (None, None) under fp16."""
+        if not self.is_int8:
+            return None, None
+        return self.key_scales[layer_idx], self.value_scales[layer_idx]
 
     def retain_blocks(self, block_ids: List[int]) -> None:
         for block_id in block_ids:
@@ -203,13 +245,27 @@ class KVCache:
         block_table: BlockTable,
         end_pos: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather logical token positions [0, end_pos) into dense K/V tensors."""
+        """Gather logical token positions [0, end_pos) into dense K/V tensors.
+
+        Under kv_cache_dtype='int8' the gather dequantizes back to self.dtype
+        on the fly, so callers always receive fp16/bf16 tensors.
+        """
         keys = torch.empty(
             (end_pos, self.num_kv_heads, self.head_dim),
             dtype=self.dtype,
             device=self.device,
         )
         values = torch.empty_like(keys)
+        if self.is_int8:
+            for pos in range(end_pos):
+                block_id, offset = self.logical_to_physical(block_table, pos)
+                k_int = self.key_cache[layer_idx, block_id, :, offset, :].to(torch.float32)
+                v_int = self.value_cache[layer_idx, block_id, :, offset, :].to(torch.float32)
+                k_s = self.key_scales[layer_idx, block_id, :, offset].to(torch.float32)
+                v_s = self.value_scales[layer_idx, block_id, :, offset].to(torch.float32)
+                keys[pos] = (k_int * k_s.unsqueeze(-1)).to(self.dtype)
+                values[pos] = (v_int * v_s.unsqueeze(-1)).to(self.dtype)
+            return keys, values
         for pos in range(end_pos):
             block_id, offset = self.logical_to_physical(block_table, pos)
             keys[pos] = self.key_cache[layer_idx, block_id, :, offset, :]

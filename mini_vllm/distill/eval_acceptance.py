@@ -170,6 +170,8 @@ def main():
     p.add_argument("--num-sequences", type=int, default=100)
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--dtype", default="bfloat16")
+    p.add_argument("--json-out", default=None,
+                   help="If set, write per-domain results to this JSON file.")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -189,6 +191,14 @@ def main():
 
     prompts_by_domain = build_eval_prompts(args.num_sequences, tokenizer)
 
+    all_results: dict = {
+        "draft": args.draft,
+        "target": args.target,
+        "gamma": args.gamma,
+        "num_sequences": args.num_sequences,
+        "domains": {},
+    }
+
     for domain, prompts in prompts_by_domain.items():
         if not prompts:
             continue
@@ -206,6 +216,13 @@ def main():
         # For an 8-layer/32-layer pair, c is roughly the draft/target forward cost ratio.
         adjusted = r["tokens_per_step"] / 1.12
         print(f"  est. latency speedup: {adjusted:.2f}x (assuming draft_cost ≈ 12% target_cost)")
+        all_results["domains"][domain] = r
+
+    if args.json_out:
+        import json
+        with open(args.json_out, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\nWrote {args.json_out}")
 
 
 if __name__ == "__main__":

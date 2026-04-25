@@ -41,14 +41,6 @@ run_and_log "$LOG_DIR/kernel/seq2048.log" \
     --batch-size 32 --num-heads 32 --num-kv-heads 8 \
     --head-dim 128 --seq-len 2048 --block-size "$BLOCK_SIZE" --iters 100
 
-run_and_log "$LOG_DIR/ablations/throughput_flash3_triton_on.log" \
-  python benchmarks/bench_throughput.py \
-    --model "$MODEL" --dtype "$DTYPE" \
-    --batch-size 32 --num-prompts "$NUM_PROMPTS" \
-    --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" \
-    --block-size "$BLOCK_SIZE" --num-gpu-blocks "$NUM_GPU_BLOCKS" \
-    --prefill-backend flash3
-
 run_and_log "$LOG_DIR/ablations/throughput_flash_triton_on.log" \
   python benchmarks/bench_throughput.py \
     --model "$MODEL" --dtype "$DTYPE" \
@@ -57,13 +49,13 @@ run_and_log "$LOG_DIR/ablations/throughput_flash_triton_on.log" \
     --block-size "$BLOCK_SIZE" --num-gpu-blocks "$NUM_GPU_BLOCKS" \
     --prefill-backend flash
 
-run_and_log "$LOG_DIR/ablations/throughput_flash3_triton_off.log" \
+run_and_log "$LOG_DIR/ablations/throughput_flash_attn_triton_off.log" \
   python benchmarks/bench_throughput.py \
     --model "$MODEL" --dtype "$DTYPE" \
     --batch-size 32 --num-prompts "$NUM_PROMPTS" \
     --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" \
     --block-size "$BLOCK_SIZE" --num-gpu-blocks "$NUM_GPU_BLOCKS" \
-    --prefill-backend flash3 --no-triton --skip-hf
+    --prefill-backend flash_attn --no-triton --skip-hf
 
 run_and_log "$LOG_DIR/ablations/throughput_math_triton_off.log" \
   python benchmarks/bench_throughput.py \
@@ -90,7 +82,7 @@ for B in 1 2 4 8 16 32 64 128; do
       --batch-size "$B" --num-prompts "$NUM_PROMPTS" \
       --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" \
       --block-size "$BLOCK_SIZE" --num-gpu-blocks "$NUM_GPU_BLOCKS" \
-      --prefill-backend flash3 --skip-hf
+      --prefill-backend flash_attn --skip-hf
 done
 
 run_and_log "$LOG_DIR/stress/base.log" \
@@ -101,7 +93,7 @@ run_and_log "$LOG_DIR/stress/base.log" \
     --prompt-len-words 256 \
     --max-tokens "$MAX_TOKENS" \
     --num-gpu-blocks "$NUM_GPU_BLOCKS" \
-    --prefill-backend flash3
+    --prefill-backend flash_attn
 
 run_and_log "$LOG_DIR/ablations/prefix_cache.log" \
   python benchmarks/bench_prefix_cache.py \
@@ -109,7 +101,7 @@ run_and_log "$LOG_DIR/ablations/prefix_cache.log" \
     --batch-size 32 --num-prompts 33 \
     --prefix-len 256 --suffix-len 32 --max-tokens 64 \
     --block-size "$BLOCK_SIZE" --num-gpu-blocks "$NUM_GPU_BLOCKS" \
-    --prefill-backend flash3
+    --prefill-backend flash_attn
 
 if [[ "$RUN_SPEC" == "1" ]]; then
   if [[ -z "$DRAFT_MODEL" ]]; then
@@ -132,7 +124,7 @@ if [[ "$RUN_PROFILE" == "1" ]]; then
         --batch-size "$PROFILE_BATCH_SIZE" --num-prompts 32 \
         --prompt-len "$PROMPT_LEN" --max-tokens 64 \
         --block-size "$BLOCK_SIZE" --num-gpu-blocks "$NUM_GPU_BLOCKS" \
-        --prefill-backend flash3 --skip-hf \
+        --prefill-backend flash_attn --skip-hf \
       > "$LOG_DIR/profile/nsys_throughput.log" 2>&1
   fi
 

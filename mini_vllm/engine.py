@@ -83,6 +83,7 @@ class LLMEngine:
             dtype=dtype,
             device=config.device,
             num_cpu_blocks=config.num_cpu_blocks,
+            kv_cache_dtype=config.kv_cache_dtype,
         )
 
         self.metrics = EngineMetrics()

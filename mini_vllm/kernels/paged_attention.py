@@ -61,11 +61,16 @@ if _HAS_TRITON:
         v_cache_ptr,          # [num_blocks, num_kv_heads, block_size, head_dim]
         block_tables_ptr,     # [num_seqs, max_num_blocks_per_seq] int32
         context_lens_ptr,     # [num_seqs] int32
+        # int8 mode only (else nullptr-equivalent); per-(block, kv_head, slot) scales:
+        k_scales_ptr,         # [num_blocks, num_kv_heads, block_size]
+        v_scales_ptr,         # [num_blocks, num_kv_heads, block_size]
         scale,
         # strides
         q_stride_s, q_stride_h,
         k_stride_b, k_stride_h, k_stride_t,
         v_stride_b, v_stride_h, v_stride_t,
+        ks_stride_b, ks_stride_h,
+        vs_stride_b, vs_stride_h,
         o_stride_s, o_stride_h,
         bt_stride_s,
         # shapes (compile-time where possible)
@@ -74,6 +79,7 @@ if _HAS_TRITON:
         HEAD_DIM: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
         MAX_NUM_BLOCKS_PER_SEQ: tl.constexpr,
+        KV_INT8: tl.constexpr,
     ):
         seq_idx = tl.program_id(0)
         head_idx = tl.program_id(1)
@@ -116,7 +122,17 @@ if _HAS_TRITON:
                 + t_range[:, None] * k_stride_t
                 + d_range[None, :]
             )
-            k = tl.load(k_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
+            if KV_INT8:
+                k_int = tl.load(k_cache_ptr + k_base, mask=mask_t[:, None], other=0).to(tl.float32)
+                k_scale_off = (
+                    physical_block * ks_stride_b
+                    + kv_head_idx * ks_stride_h
+                    + t_range
+                )
+                k_scale = tl.load(k_scales_ptr + k_scale_off, mask=mask_t, other=0.0).to(tl.float32)
+                k = k_int * k_scale[:, None]
+            else:
+                k = tl.load(k_cache_ptr + k_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
 
             # ---- scores = q @ k^T * scale : [BLOCK_SIZE] ----
             s = tl.sum(q[None, :] * k, axis=1) * scale
@@ -135,7 +151,17 @@ if _HAS_TRITON:
                 + t_range[:, None] * v_stride_t
                 + d_range[None, :]
             )
-            v = tl.load(v_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
+            if KV_INT8:
+                v_int = tl.load(v_cache_ptr + v_base, mask=mask_t[:, None], other=0).to(tl.float32)
+                v_scale_off = (
+                    physical_block * vs_stride_b
+                    + kv_head_idx * vs_stride_h
+                    + t_range
+                )
+                v_scale = tl.load(v_scales_ptr + v_scale_off, mask=mask_t, other=0.0).to(tl.float32)
+                v = v_int * v_scale[:, None]
+            else:
+                v = tl.load(v_cache_ptr + v_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
 
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
@@ -154,12 +180,23 @@ def paged_attention(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks] int32
     context_lens: torch.Tensor,  # [num_seqs] int32
     scale: float,
+    key_scales: torch.Tensor | None = None,    # [num_blocks, num_kv_heads, block_size] (int8 only)
+    value_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Triton paged attention. Falls back to reference if Triton isn't present."""
+    """Triton paged attention. Falls back to reference if Triton isn't present.
+
+    When key_cache/value_cache are int8, key_scales and value_scales must be
+    provided; the kernel dequantizes per-token in registers.
+    """
+    is_int8 = key_cache.dtype == torch.int8
+    if is_int8 and (key_scales is None or value_scales is None):
+        raise ValueError("int8 paged_attention requires key_scales and value_scales")
+
     if not _HAS_TRITON or not query.is_cuda:
         from mini_vllm.kernels.reference_attention import reference_paged_attention
         return reference_paged_attention(
-            query, key_cache, value_cache, block_tables, context_lens, scale
+            query, key_cache, value_cache, block_tables, context_lens, scale,
+            key_scales=key_scales, value_scales=value_scales,
         )
 
     num_seqs, num_heads, head_dim = query.shape
@@ -170,13 +207,26 @@ def paged_attention(
 
     out = torch.empty_like(query)
 
+    if is_int8:
+        ks_b, ks_h = key_scales.stride(0), key_scales.stride(1)
+        vs_b, vs_h = value_scales.stride(0), value_scales.stride(1)
+        ks_ptr, vs_ptr = key_scales, value_scales
+    else:
+        ks_b = ks_h = vs_b = vs_h = 0
+        # Triton requires non-null pointer args even when KV_INT8=False; pass
+        # the K/V cache as a dummy. The branch in the kernel never reads them.
+        ks_ptr, vs_ptr = key_cache, value_cache
+
     grid = (num_seqs, num_heads)
     _paged_attention_kernel[grid](
         out, query, key_cache, value_cache, block_tables, context_lens,
+        ks_ptr, vs_ptr,
         scale,
         query.stride(0), query.stride(1),
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
         value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+        ks_b, ks_h,
+        vs_b, vs_h,
         out.stride(0), out.stride(1),
         block_tables.stride(0),
         num_kv_heads=num_kv_heads,
@@ -184,5 +234,6 @@ def paged_attention(
         HEAD_DIM=head_dim,
         BLOCK_SIZE=block_size,
         MAX_NUM_BLOCKS_PER_SEQ=max_num_blocks,
+        KV_INT8=is_int8,
     )
     return out

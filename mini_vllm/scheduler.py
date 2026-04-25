@@ -56,7 +56,12 @@ class Scheduler:
         self.swapped: deque[Sequence] = deque()
         self.running: List[Sequence] = []
         self.prefix_cache = (
-            PrefixCache(kv_cache, config.block_size, config.prefix_cache_max_entries)
+            PrefixCache(
+                kv_cache,
+                config.block_size,
+                config.prefix_cache_max_entries,
+                eviction=config.prefix_cache_eviction,
+            )
             if config.enable_prefix_cache
             else None
         )

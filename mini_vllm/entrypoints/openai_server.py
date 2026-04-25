@@ -273,7 +273,7 @@ def main() -> None:
     parser.add_argument(
         "--prefill-backend",
         default="flash",
-        choices=["auto", "flash", "flash3", "flash_attn", "mem_efficient", "math"],
+        choices=["auto", "flash", "flash_attn", "mem_efficient", "math"],
     )
     parser.add_argument("--no-triton", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")

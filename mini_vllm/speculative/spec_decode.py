@@ -53,6 +53,12 @@ class SpeculativeExecutor:
         self.config = config
         self.target = target_engine
         self.gamma = config.spec_num_draft_tokens
+        self.adaptive_gamma = config.spec_adaptive_gamma
+        self.gamma_min = config.spec_gamma_min
+        self.gamma_max = config.spec_gamma_max
+        self.gamma_alpha = config.spec_gamma_ewma_alpha
+        # Per-seq EWMA of accepted-fraction. Initialized lazily on first sight.
+        self._accept_ewma: dict[int, float] = {}
 
         # Load the draft model with the same loader, but force Triton off
         # if user wants (draft is small enough that SDPA is fine).
@@ -98,17 +104,56 @@ class SpeculativeExecutor:
             )
 
     # ------------------------------------------------------------------
+    # Adaptive-γ selection
+    # ------------------------------------------------------------------
+
+    def _select_gamma(self, seq: Sequence) -> int:
+        """Pick γ for this sequence this step.
+
+        Static mode: always self.gamma.
+        Adaptive mode: linearly interpolate between gamma_min and gamma_max
+        using the per-seq EWMA acceptance fraction. Sequences not yet seen
+        warm-start at self.gamma. The mapping is the standard spec-decode
+        intuition: at α=1 propose gamma_max (every draft accepted), at α=0
+        propose gamma_min (drafts are useless, don't pay the verify cost
+        beyond the minimum).
+        """
+        if not self.adaptive_gamma:
+            return self.gamma
+        alpha = self._accept_ewma.get(seq.seq_id)
+        if alpha is None:
+            return max(self.gamma_min, min(self.gamma, self.gamma_max))
+        span = self.gamma_max - self.gamma_min
+        gamma = int(round(self.gamma_min + alpha * span))
+        return max(self.gamma_min, min(gamma, self.gamma_max))
+
+    def release_seq(self, seq_id: int) -> None:
+        """Drop EWMA + draft state for a finished sequence."""
+        self._accept_ewma.pop(seq_id, None)
+        bt = self._draft_block_tables.pop(seq_id, None)
+        if bt is not None and len(bt) > 0:
+            self.draft_kv_cache.allocator.free_many(bt.as_list())
+        self._draft_cached_tokens.pop(seq_id, None)
+
+    # ------------------------------------------------------------------
     # Public step
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
     def step(self, seqs: List[Sequence]) -> List[List[int]]:
         """For each decode-running sequence, propose γ tokens with draft,
-        then verify with target. Returns accepted tokens per seq (1..γ+1)."""
+        then verify with target. Returns accepted tokens per seq (1..γ+1).
+
+        With spec_adaptive_gamma=True, γ is chosen per-seq based on a rolling
+        EWMA of acceptance fraction: high acceptance → propose more (closer to
+        gamma_max), low acceptance → propose fewer (closer to gamma_min).
+        """
         accepted_per_seq: List[List[int]] = []
         for seq in seqs:
+            gamma_seq = self._select_gamma(seq)
+
             # 1) Draft γ tokens.
-            draft_token_ids, draft_probs = self._draft_propose(seq, self.gamma)
+            draft_token_ids, draft_probs = self._draft_propose(seq, gamma_seq)
 
             # 2) Target verify — one forward pass over γ draft tokens.
             target_probs = self._target_verify(seq, draft_token_ids)
@@ -120,6 +165,16 @@ class SpeculativeExecutor:
                 seq, draft_token_ids, draft_probs, target_probs
             )
             accepted_per_seq.append(accepted)
+
+            # Update EWMA: fraction of γ drafts that survived (excludes the
+            # bonus +1 token, which isn't a "draft was right" signal).
+            if self.adaptive_gamma and gamma_seq > 0:
+                survived = max(len(accepted) - 1, 0)
+                frac = min(survived / gamma_seq, 1.0)
+                prev = self._accept_ewma.get(seq.seq_id, frac)
+                self._accept_ewma[seq.seq_id] = (
+                    self.gamma_alpha * frac + (1.0 - self.gamma_alpha) * prev
+                )
 
             # 4) Commit accepted tokens to the TARGET KV cache.
             # The target_verify step above already wrote KV for all γ draft
