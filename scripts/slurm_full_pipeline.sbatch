@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=mini-vllm-full
-#SBATCH --account=YOUR_ACCOUNT
+#SBATCH --account=jieyuz_1727
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
@@ -23,7 +23,7 @@ TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$HF_HOME}
 DATA_DIR=${DATA_DIR:-$SCRATCH_ROOT/distill_data}
 DRAFT_DIR=${DRAFT_DIR:-$SCRATCH_ROOT/outputs/llama-3.1-8b-draft-8layer}
 MODEL=${MODEL:-meta-llama/Llama-3.1-8B}
-GPU_TYPE=${GPU_TYPE:-h100}                 # h100 | a100
+GPU_TYPE=${GPU_TYPE:-a100}                 # a100 (FA2). FA3/Hopper path was removed.
 CUDA_MODULE=${CUDA_MODULE:-cuda/12.6.3}
 GCC_MODULE=${GCC_MODULE:-gcc/13.3.0}
 RUN_DISTILL=${RUN_DISTILL:-1}              # 1 -> run distill pipeline
@@ -99,19 +99,8 @@ if [[ "$INSTALL_DEPS" == "1" ]]; then
 fi
 
 if [[ "$INSTALL_FLASH_ATTN" == "1" ]]; then
-  if [[ "$GPU_TYPE" == "h100" ]]; then
-    FA_DIR="$SCRATCH_ROOT/flash-attention"
-    if [[ ! -d "$FA_DIR" ]]; then
-      git clone https://github.com/Dao-AILab/flash-attention "$FA_DIR"
-    fi
-    cd "$FA_DIR/hopper"
-    MAX_JOBS="$MAX_JOBS" pip install . --no-build-isolation
-    cd "$REPO_ROOT"
-    python -c "import flash_attn_interface; print('FA3 ok')"
-  else
-    pip install flash-attn --no-build-isolation
-    python -c "from flash_attn import flash_attn_func; print('FA2 ok')"
-  fi
+  pip install flash-attn --no-build-isolation
+  python -c "from flash_attn import flash_attn_func; print('FA2 ok')"
 fi
 
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'cap', torch.cuda.get_device_capability(0))"
@@ -166,23 +155,13 @@ if [[ "$RUN_BENCH" == "1" ]]; then
     exit 1
   fi
 
-  if [[ "$GPU_TYPE" == "h100" ]]; then
-    LOG_ROOT="$SCRATCH_ROOT/logs/h100" \
-    MODEL="$MODEL" \
-    RUN_SPEC="$RUN_SPEC" \
-    RUN_PROFILE="$RUN_PROFILE" \
-    DRAFT_MODEL="$DRAFT_DIR/final" \
-    bash scripts/run_h100_all.sh
-    LATEST_RUN="$(ls -td "$SCRATCH_ROOT"/logs/h100/* | head -n 1)"
-  else
-    LOG_ROOT="$SCRATCH_ROOT/logs/a100" \
-    MODEL="$MODEL" \
-    RUN_SPEC="$RUN_SPEC" \
-    RUN_PROFILE="$RUN_PROFILE" \
-    DRAFT_MODEL="$DRAFT_DIR/final" \
-    bash scripts/run_a100_all.sh
-    LATEST_RUN="$(ls -td "$SCRATCH_ROOT"/logs/a100/* | head -n 1)"
-  fi
+  LOG_ROOT="$SCRATCH_ROOT/logs/a100" \
+  MODEL="$MODEL" \
+  RUN_SPEC="$RUN_SPEC" \
+  RUN_PROFILE="$RUN_PROFILE" \
+  DRAFT_MODEL="$DRAFT_DIR/final" \
+  bash scripts/run_a100_all.sh
+  LATEST_RUN="$(ls -td "$SCRATCH_ROOT"/logs/a100/* | head -n 1)"
 
   bash scripts/summarize_logs.sh "$LATEST_RUN" > "$LATEST_RUN/summary.md"
   echo "Benchmark summary written to $LATEST_RUN/summary.md"
