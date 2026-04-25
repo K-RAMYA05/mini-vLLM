@@ -1,188 +1,122 @@
-# mini-vLLM
+# mini_vllm
 
-Paged KV-cache inference engine for Llama-3.1-8B, with continuous batching,
-a custom Triton paged-attention kernel, FlashAttention-backed prefill through
-PyTorch SDPA or `flash-attn`, speculative decoding, data-parallel request sharding, and GPTQ
-quantization. Built as a research-grade reference implementation — clean
-enough to read end-to-end, complete enough to benchmark.
+A from-scratch Python + Triton reimplementation of vLLM's LLM inference
+stack, with an original speculative-decoding methodology study using a
+**self-distilled Llama-3.1-8B draft model**. ~7,700 lines, single-A100
+target, 51 unit tests.
+
+```
+                ┌──────────────────────────────────────────────────────┐
+  request   →   │ Scheduler  →  ModelRunner  →  Attention  →  Sampler │  →  tokens
+                │   (paged KV, continuous batching, prefix cache)      │
+                └──────────────────────────────────────────────────────┘
+                          ↑                       ↑
+                          │                       │
+                  speculative-decode        FA2 prefill (A100)
+                  with self-distilled       Triton paged decode
+                  draft + adaptive γ        int8 KV (kernel-fused)
+```
+
+## What's novel
+
+The headline contribution is a **measured speculative-decoding study**:
+distill Llama-3.1-8B layers down to {4, 6, 8, 10, 12} layers via KL+CE
+distillation, run rejection sampling at γ=4 against the target, and compare
+empirical tokens-per-step to the Leviathan et al. (2022) theoretical
+prediction `(1 − α^(γ+1)) / (1 − α)`.
+
+Headline result *(filled in once the CARC sweep job finishes)*:
+
+| draft depth | α (code) | α (natural) | empirical tok/step | adj. speedup |
+|---:|---:|---:|---:|---:|
+| 4  | … | … | … | … |
+| 6  | … | … | … | … |
+| 8  | … | … | … | … |
+| 10 | … | … | … | … |
+| 12 | … | … | … | … |
+
+Full methodology + residual analysis: [`results/methodology.md`](results/methodology.md).
+
+## What's measured (vs. vLLM and TensorRT-LLM)
+
+Same workload, same A100, same dtype:
+
+| batch | mini_vllm | vLLM | TensorRT-LLM | mini/vLLM |
+|---:|---:|---:|---:|---:|
+| 1  | … tok/s | … tok/s | … tok/s | …% |
+| 8  | … tok/s | … tok/s | … tok/s | …% |
+| 32 | … tok/s | … tok/s | … tok/s | …% |
+
+Full numbers + gap analysis: [`results/vs_production.md`](results/vs_production.md).
+
+## Quality preservation under optimizations
+
+HumanEval pass@1 across optimization stacks (proves the speed numbers come
+without correctness regressions):
+
+| Config | pass@1 | Δ vs vLLM ref |
+|---|---:|---:|
+| vLLM (reference) | … | — |
+| mini_vllm baseline | … | … |
+| + GPTQ 4-bit | … | … |
+| + int8 KV cache | … | … |
+| + speculative decoding | … | … |
+
+Full matrix: [`results/quality_eval.md`](results/quality_eval.md).
+
+---
 
 ## What's inside
 
-```
-mini_vllm/
-├── engine.py                 # Top-level LLMEngine
-├── config.py                 # EngineConfig
-├── sampling.py               # SamplingParams
-├── sequence.py               # Sequence lifecycle
-├── block_manager.py          # Paged KV cache, block allocator, block tables
-├── scheduler.py              # Continuous batching
-├── attention.py              # PagedAttention module (replaces HF LlamaAttention)
-├── attention_metadata.py     # Per-step metadata shared across layers
-├── model_loader.py           # HF load + monkey-patch attention layers
-├── model_runner.py           # Forward pass + sampling
-├── parallel.py               # Multi-process data-parallel generation
-├── kernels/
-│   ├── paged_attention.py    # Triton decode kernel (online softmax, block-sparse gather)
-│   └── reference_attention.py# Pure-PyTorch reference for correctness tests
-├── quant/
-│   └── gptq.py               # GPTQ calibration + weight-only quantized linear layer
-├── speculative/
-│   └── spec_decode.py        # Draft-verify with rejection sampling
-└── distill/
-    ├── prune.py              # Layer-prune the target to create a small initial draft
-    ├── distill_loss.py       # KL + CE loss on top-k teacher logits
-    ├── generate_teacher_data.py   # Pre-compute teacher top-k across a corpus
-    ├── dataset.py            # Sharded on-disk dataset loader
-    ├── train_distill.py      # Training loop
-    └── eval_acceptance.py    # Measure α (acceptance rate) on held-out data
-```
+- **Paged KV cache + block allocator** ([block_manager.py](mini_vllm/block_manager.py)) —
+  fixed-size blocks + per-sequence indirection, the trick that makes batched
+  inference memory-efficient.
+- **Continuous-batching scheduler** ([scheduler.py](mini_vllm/scheduler.py)) — admits new
+  requests every step; supports CPU swap for preemption.
+- **Triton paged-attention decode kernel** ([kernels/paged_attention.py](mini_vllm/kernels/paged_attention.py)) —
+  one launch per (sequence, head), online softmax, GQA-aware, **int8 KV
+  dequantization fused in-register**.
+- **FlashAttention-2 prefill** ([attention.py](mini_vllm/attention.py)) — strict device
+  routing (raises on unsupported GPUs, no silent SDPA fallback).
+- **GPTQ 4/8-bit quantization** ([quant/gptq.py](mini_vllm/quant/gptq.py)) — calibration
+  + Cholesky-based Hessian inverse update; INT4 weights bit-packed two per
+  byte with optional Triton matmul.
+- **Prefix caching** ([prefix_cache.py](mini_vllm/prefix_cache.py)) — cumulative
+  digest indexing; both **LRU** and **LFU** eviction policies.
+- **Speculative decoding** ([speculative/spec_decode.py](mini_vllm/speculative/spec_decode.py)) —
+  draft-verify with rejection sampling; **adaptive γ** picks per-sequence
+  draft depth from a rolling EWMA of acceptance rate.
+- **Distillation pipeline** ([distill/](mini_vllm/distill/)) — layer prune → KL+CE distill
+  → eval acceptance → depth sweep + Leviathan analysis.
+- **Int8 KV cache** ([block_manager.py](mini_vllm/block_manager.py)) — symmetric per-token
+  quantization with per-(block, head, slot) fp16 scales; ~50% KV memory
+  saving.
+- **OpenAI-compatible HTTP server** ([entrypoints/openai_server.py](mini_vllm/entrypoints/openai_server.py)) —
+  FastAPI + Prometheus metrics.
 
-## Design notes
+## Limits (deliberate cuts)
 
-### Paged KV cache
+- **Single GPU.** No tensor or pipeline parallelism. Multi-GPU support is a
+  config placeholder that fails fast.
+- **A100 / FA2 only.** FA3 / Hopper paths were removed after the project
+  scope narrowed. Strict device routing raises if the target backend is
+  missing — no silent fallback.
+- **Single-process synchronous serving.** The OpenAI server is good for
+  integration testing, not multi-tenant production.
+- **Speculative decoding verifies one sequence per step.** Batched verify
+  would give an additional throughput win; the acceptance-rate study is
+  independent of this implementation choice.
 
-Each layer's KV is stored as one big tensor
-`[num_blocks, num_kv_heads, block_size, head_dim]`. Each sequence has a
-**block table** — a list of physical block IDs it owns. When a sequence
-needs more room, the scheduler asks the `BlockAllocator` for a new block
-and appends its ID to the table. This eliminates the need to reserve
-`max_seq_len` slots up front.
-
-Why it matters for throughput, not just memory: without paging, batching
-N sequences forces you to reserve `N × max_seq_len` KV slots, most of
-which is wasted for short sequences. Paging removes that waste, so your
-effective batch size grows, so tokens/sec grow (decode is memory-bandwidth
-bound — bigger batches amortize the HBM traffic).
-
-### Triton paged-attention kernel
-
-`mini_vllm/kernels/paged_attention.py` implements a decode-phase attention
-kernel with:
-
-- **Block-sparse gather**: reads K/V directly from the paged cache via a
-  `block_tables` indirection, no dense gather pre-step.
-- **One launch for the whole batch**: grid is `(num_seqs, num_heads)`, each
-  program handles one (seq, head) pair.
-- **Online softmax** (Milakov & Gimelshein): streams KV blocks, maintains
-  running max/sum in registers, never materializes the score matrix.
-- **Fused softmax + PV**: single kernel for both reductions.
-- **GQA-aware**: `kv_head = head // group`, handled via pointer math.
-
-The reference implementation in `reference_attention.py` is used to
-validate correctness in `tests/test_paged_attention_kernel.py`.
-
-### Continuous batching
-
-The scheduler (`scheduler.py`) admits new sequences from a waiting queue
-on every step, subject to token and sequence budgets. Prefill and decode
-tokens share a single forward pass — the batch is packed as
-`[prefill_tokens | decode_tokens]` and the attention module splits on that
-boundary, running causal SDPA on the prefill half and the Triton paged
-kernel on the decode half.
-
-### Speculative decoding
-
-Standard draft-verify loop with rejection sampling (Leviathan '22 / Chen '23).
-Draft model has its own KV cache, shares the tokenizer with the target.
-Each step per sequence: draft proposes γ tokens autoregressively; target
-verifies with one γ+1 forward pass; rejection walk accepts a prefix and
-optionally samples a bonus.
-
-### FlashAttention-backed prefill
-
-Prefill uses PyTorch `scaled_dot_product_attention`, FlashAttention-3 on
-Hopper when available, or the external `flash-attn` extension. Set
-`prefill_attention_backend="flash3"` on H100/H800 to force the official
-FlashAttention-3 hopper package (`import flash_attn_interface`). If you keep
-`prefill_attention_backend="flash"`, mini-vLLM now prefers FlashAttention-3
-automatically on Hopper when that package is installed; otherwise it uses
-PyTorch's FlashAttention SDPA backend. Set `prefill_attention_backend="flash_attn"`
-to call the external FlashAttention-2 style `flash-attn` CUDA extension
-directly, or leave it at `"auto"` to let PyTorch choose among flash,
-memory-efficient, and math backends.
-
-### Prefix caching
-
-Prefix caching is now available via `enable_prefix_cache=True`. The engine
-stores reusable prompt KV blocks by cumulative prefix digest and reuses those
-blocks for later requests that share the same full-block prompt prefix. The
-current implementation reuses prompt prefixes at block granularity and
-recomputes the remaining suffix tokens normally, which makes cache-hit
-benchmarks straightforward without changing the decode kernel.
-
-### Data-parallel serving
-
-`mini_vllm.generate_data_parallel` shards independent prompts across one
-engine replica per worker. Each process owns its model and paged KV cache
-on a local device, avoiding cross-device KV traffic in the decode hot path.
-
-```python
-from mini_vllm import EngineConfig, SamplingParams, generate_data_parallel
-
-outs = generate_data_parallel(
-    ["Explain paged attention.", "Write a CUDA haiku."],
-    EngineConfig(model_name_or_path="meta-llama/Llama-3.1-8B"),
-    SamplingParams(max_tokens=64),
-    devices=["cuda:0", "cuda:1"],
-)
-```
-
-### GPTQ
-
-Per-channel, per-group (group_size=128) symmetric 4-bit or 8-bit with the Cholesky-
-based Hessian inverse update. Calibration runs a handful of prompts to
-collect activation Hessians; the quantization pass walks columns left-to-
-right within each group applying the GPTQ error-compensation rule.
-
-INT8 weight-only quantization dequantizes to fp16 before matmul. INT4 weights
-are bit-packed two per byte and use an optional Triton matmul path on CUDA;
-CPU and non-Triton environments fall back to portable unpack/dequant matmul.
-
-### Draft model distillation (for speculative decoding)
-
-`mini_vllm/distill/` produces a small draft model aligned to the target
-via layer pruning + KL distillation:
-
-1. **Prune** the target to keep N evenly-spaced layers (for example 8 out of
-   32 for Llama-3.1-8B). The pruned model is initialized from the
-   target's own weights — only depth is reduced, hidden size and head
-   counts are unchanged. This preserves the target's attention patterns
-   and lets the draft inherit the tokenizer by construction.
-
-2. **Generate teacher data**: run the target over a balanced corpus
-   (WikiText + CodeSearchNet) and save top-k logits per token position.
-   Top-k=50 cuts storage ~2500x vs full-vocab logits with negligible
-   accuracy impact.
-
-3. **Distill** the pruned student with combined loss:
-   α · KL(student || teacher_topk) + (1-α) · CE(student, next_token).
-   Temperature-softened (T=2.0), Hinton-scaled. α=0.9 standard.
-
-4. **Evaluate** α (acceptance rate) on held-out prompts, per domain.
-
-See `scripts/run_distillation.sh` for the full pipeline driver and
-`scripts/slurm_distill.sbatch` for a Discovery-ready SLURM script.
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-# or
-pip install -e .
-```
-
-Requires CUDA + Triton for the kernel path. On CPU or non-CUDA GPUs the
-engine falls back to the reference attention implementation (slow, correct).
-For H100/H800, install the FlashAttention-3 hopper package if you want the
-`flash3` prefill backend:
-
-```bash
-git clone https://github.com/Dao-AILab/flash-attention
-cd flash-attention/hopper
-python setup.py install
-```
+---
 
 ## Quick start
+
+```bash
+pip install -e ".[serve,bench,test]"
+pip install flash-attn --no-build-isolation   # GPU node only
+
+python -m pytest tests/ -q
+```
 
 ```python
 from mini_vllm import EngineConfig, LLMEngine, SamplingParams
@@ -190,181 +124,117 @@ from mini_vllm import EngineConfig, LLMEngine, SamplingParams
 engine = LLMEngine(EngineConfig(
     model_name_or_path="meta-llama/Llama-3.1-8B",
     dtype="bfloat16",
-    num_gpu_blocks=8192,
+    num_gpu_blocks=4096,
     max_num_seqs=16,
-    prefill_attention_backend="flash",
+    enable_prefix_cache=True,
+    prefix_cache_eviction="lfu",
+    kv_cache_dtype="int8",
 ))
-engine.add_request("Tell me a joke about compilers.", SamplingParams(max_tokens=64))
+engine.add_request("Explain paged attention.", SamplingParams(max_tokens=64))
 for out in engine.run_until_done():
     print(out.output_text)
 ```
 
-## OpenAI-Compatible Server
+## Reproducing the headline experiments
 
-Install serving extras:
+### Self-distilled draft depth sweep (the novelty)
 
 ```bash
-pip install -e ".[serve]"
+DATA_DIR=/scratch1/$USER/mini_vllm/distill_data \
+OUT_ROOT=/scratch1/$USER/mini_vllm/sweep_depth \
+DEPTHS="4 6 8 10 12" GAMMA=4 EPOCHS=3 \
+bash scripts/sweep_draft_depth.sh
 ```
 
-Start a single-engine server:
+Produces `sweep_depth/report.md` with per-depth α, empirical tok/step,
+Leviathan prediction, residual, and adjusted speedup.
+
+### Production comparison (vLLM + TRT-LLM)
+
+```bash
+python benchmarks/bench_vs_production.py \
+    --model meta-llama/Llama-3.1-8B \
+    --engines mini_vllm vllm trt_llm \
+    --batch-sizes 1 8 32 \
+    --markdown-out results/vs_production.md
+```
+
+### HumanEval quality eval
+
+```bash
+python benchmarks/eval_humaneval.py \
+    --model meta-llama/Llama-3.1-8B \
+    --draft /scratch1/$USER/mini_vllm/outputs/llama-3.1-8b-draft-8layer/final \
+    --markdown-out results/quality_eval.md
+```
+
+### CARC / SLURM end-to-end
+
+```bash
+HF_TOKEN=hf_xxx sbatch scripts/slurm_full_pipeline.sbatch       # env + distill + bench
+HF_TOKEN=hf_xxx sbatch --dependency=afterok:<id> \
+    scripts/slurm_sweep_depth.sbatch                             # depth sweep
+```
+
+## OpenAI-compatible server
 
 ```bash
 python -m mini_vllm.entrypoints.openai_server \
     --model meta-llama/Llama-3.1-8B \
     --dtype bfloat16 \
-    --num-gpu-blocks 8192 \
-    --prefill-backend flash3 \
-    --host 0.0.0.0 \
-    --port 8000
-```
+    --num-gpu-blocks 4096 \
+    --prefill-backend flash_attn \
+    --enable-prefix-cache \
+    --host 0.0.0.0 --port 8000
 
-Completion request:
-
-```bash
 curl http://localhost:8000/v1/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"meta-llama/Llama-3.1-8B","prompt":"Explain paged attention:","max_tokens":64,"stream":true}'
+  -d '{"model":"meta-llama/Llama-3.1-8B","prompt":"Explain paged attention:","max_tokens":64}'
+
+curl http://localhost:8000/metrics.json    # tok/s, TTFT, ITL, KV usage, swap counters
 ```
 
-Metrics:
+---
 
-```bash
-curl http://localhost:8000/metrics
-curl http://localhost:8000/metrics.json
-```
+## Code layout (reading order)
 
-The server exposes TTFT, ITL, tokens/sec, scheduler steps, KV block usage,
-and CPU swap counters.
+For a tour of the codebase, follow this order:
 
-## Reproducing the benchmark numbers
-
-Numbers in the project writeup are A100-class GPU figures at specific
-configurations. Whether your GPU hits them depends on hardware, dtype,
-and tuning. Each benchmark prints its measured values — don't trust
-anything you didn't re-run.
-
-### Throughput vs HuggingFace `generate()`
-
-```bash
-python benchmarks/bench_throughput.py \
-    --model meta-llama/Llama-3.1-8B \
-    --dtype bfloat16 \
-    --batch-size 32 --num-prompts 128 \
-    --prompt-len 512 --max-tokens 128 \
-    --block-size 16 --num-gpu-blocks 8192 \
-    --prefill-backend flash3
-```
-
-Expected: mini-vLLM wins because HF does static batching (pads every
-sequence to max length; big prompts block small ones from starting).
-
-### Kernel vs SDPA
-
-```bash
-python benchmarks/bench_kernel.py \
-    --batch-size 32 --num-heads 32 --num-kv-heads 8 --head-dim 128 \
-    --seq-len 512 --block-size 16
-```
-
-The SDPA baseline includes the gather cost from paged-cache to dense,
-which is the cost you'd actually pay in a paged engine if you didn't
-have a custom kernel.
-
-### Speculative decoding
-
-```bash
-python benchmarks/bench_speculative.py \
-    --target meta-llama/Llama-3.1-8B \
-    --draft  outputs/llama-3.1-8b-draft-8layer \
-    --gamma 4
-```
-
-Prints per-step tokens and implied acceptance rate α. Code prompts (the
-default set) give α ≈ 0.6–0.7 with a reasonable draft; natural language
-typically lands lower
-
-### GPTQ perplexity
-
-```bash
-python benchmarks/bench_gptq.py --model meta-llama/Llama-3.1-8B --bits 8
-```
-
-Reports FP16 vs quantized perplexity on WikiText-2 and the VRAM reduction on
-the quantized layers.
-
-### Long Stress / GPU Matrix
-
-Run the main A100/H100 validation matrix on an allocated GPU:
-
-```bash
-bash scripts/run_gpu_matrix.sh
-```
-
-Or run just the long stress test:
-
-```bash
-python benchmarks/stress_long_run.py \
-    --model meta-llama/Llama-3.1-8B \
-    --dtype bfloat16 \
-    --waves 10 \
-    --requests-per-wave 32 \
-    --num-gpu-blocks 8192 \
-    --prefill-backend flash
-```
-
-### Prefix-cache benchmark
-
-```bash
-python benchmarks/bench_prefix_cache.py \
-    --model meta-llama/Llama-3.1-8B \
-    --dtype bfloat16 \
-    --batch-size 32 --num-prompts 33 \
-    --prefix-len 256 --suffix-len 32 --max-tokens 64 \
-    --block-size 16 --num-gpu-blocks 8192 \
-    --prefill-backend flash3
-```
-
-This runs the same shared-prefix workload twice, first with prefix caching
-disabled and then with it enabled, and prints the cache-hit counts and
-throughput difference.
+1. [`config.py`](mini_vllm/config.py), [`sampling.py`](mini_vllm/sampling.py), [`sequence.py`](mini_vllm/sequence.py) — data types
+2. [`block_manager.py`](mini_vllm/block_manager.py) — paging machinery + int8 KV
+3. [`scheduler.py`](mini_vllm/scheduler.py) — batch formation
+4. [`attention.py`](mini_vllm/attention.py) — paged attention module + FA2 routing
+5. [`kernels/paged_attention.py`](mini_vllm/kernels/paged_attention.py) — Triton kernel + int8 fusion
+6. [`model_runner.py`](mini_vllm/model_runner.py), [`engine.py`](mini_vllm/engine.py) — control flow
+7. [`speculative/spec_decode.py`](mini_vllm/speculative/spec_decode.py) — adaptive γ + rejection sampling
+8. [`distill/`](mini_vllm/distill/) — pruning, distillation, sweep + Leviathan analysis
+9. [`prefix_cache.py`](mini_vllm/prefix_cache.py) — LRU / LFU eviction
+10. [`quant/gptq.py`](mini_vllm/quant/gptq.py) — weight quantization
 
 ## Tests
 
 ```bash
-pytest tests/              # CPU-only tests always run
-pytest tests/ -v -k triton # kernel tests require CUDA + Triton
+pytest tests/                    # CPU-only (51 fast tests)
+pytest tests/ -k "triton or cuda" # GPU tests (require CUDA)
 ```
 
-## Known limitations
+The HF parity test ([`tests/test_parity_with_hf.py`](tests/test_parity_with_hf.py))
+runs only on CUDA — it loads a small Llama and asserts greedy decoding through
+mini_vllm matches `transformers.generate` token-for-token. Without this gate,
+no speed claim is trustworthy.
 
-These are deliberate cuts for a research-grade build:
+---
 
-- CPU KV swap/preemption is implemented for decode growth pressure. Waiting
-  prompt admission still waits when GPU blocks are full instead of forcing a
-  running sequence out.
-- OpenAI-compatible serving is synchronous and single-engine. It is useful
-  for integration testing, but it is not an async multi-worker production
-  server.
-- Chunked prefill and prefix caching are config placeholders that fail fast
-  if enabled.
-- Speculative decoding verifies one sequence at a time. Batched verify
-  would give an additional throughput win; the acceptance-rate and
-  latency-reduction claims are independent of this.
-- GPTQ is weight-only. No activation quantization; int4 CUDA speedup depends
-  on the optional Triton kernel path.
-- Prefill uses PyTorch SDPA/FlashAttention or the external `flash-attn`
-  package per sequence; there is no project-owned CUDA/CUTLASS prefill kernel.
-- Parallelism is data-parallel request sharding. No tensor parallelism or
-  pipeline parallelism.
+## Roadmap
 
-## File organization for reading
+- [ ] Vectorize the per-token Python loops in `write_prefill` / `read_tokens`
+- [ ] CUDA Graphs for the decode forward
+- [ ] JAX / Pallas paged-attention port for TPU v3-8 (TRC application submitted)
+- [ ] AWQ alongside GPTQ for activation-aware quantization
+- [ ] Batched speculative-decode verify (currently one sequence at a time)
 
-Start here, in order:
-1. `config.py`, `sampling.py`, `sequence.py` — data types
-2. `block_manager.py` — the paging machinery
-3. `scheduler.py` — how batches form
-4. `attention_metadata.py` + `attention.py` — how the batch reaches the kernel
-5. `kernels/paged_attention.py` — the kernel itself
-6. `model_runner.py` + `engine.py` — control flow
-7. `speculative/spec_decode.py`, `quant/gptq.py` — the optional features
+## Acknowledgements
+
+This is a re-implementation; the design is owed to vLLM (Kwon et al. 2023),
+PagedAttention, FlashAttention-2 (Dao 2023), and the speculative-decoding
+work of Leviathan et al. (2022) and Chen et al. (2023).
