@@ -1,4 +1,6 @@
 """Scheduler tests. CPU-only — no model, just the queue logic."""
+import time
+
 import pytest
 import torch
 
@@ -66,6 +68,48 @@ def test_seq_budget_caps_admission():
     assert len(out.prefill_seqs) == 4
 
 
+def test_scheduler_can_skip_large_head_of_line_request():
+    sched = _make_scheduler(max_num_batched_tokens=32, enable_chunked_prefill=False)
+    long_seq = _make_seq(40)
+    short_seq = _make_seq(12)
+    sched.add_seq(long_seq)
+    sched.add_seq(short_seq)
+
+    out = sched.schedule()
+
+    assert short_seq in out.prefill_seqs
+    assert long_seq not in out.prefill_seqs
+
+
+def test_scheduler_prefers_higher_priority_request():
+    sched = _make_scheduler(enable_chunked_prefill=False)
+    low = _make_seq(12)
+    high = _make_seq(12)
+    low.priority = 0
+    high.priority = 2
+    sched.add_seq(low)
+    sched.add_seq(high)
+
+    out = sched.schedule()
+
+    assert out.prefill_seqs[0] is high
+
+
+def test_scheduler_batches_one_lora_adapter_cohort_per_step():
+    sched = _make_scheduler(enable_chunked_prefill=False)
+    base = _make_seq(12)
+    themed = _make_seq(12)
+    themed.lora_adapter_name = "sql"
+    themed.priority = 1
+    sched.add_seq(base)
+    sched.add_seq(themed)
+
+    out = sched.schedule()
+
+    assert out.adapter_name == "sql"
+    assert out.prefill_seqs == [themed]
+
+
 def test_decode_grows_block_table_when_full():
     """Scheduler allocates a new block when the next token won't fit.
 
@@ -122,6 +166,87 @@ def test_scheduler_swaps_instead_of_aborting_on_decode_oom():
     assert sched.kv_cache.allocator.num_free == 1
 
 
+def test_scheduler_holds_new_prefill_briefly_for_lookahead_decode():
+    sched = _make_scheduler(enable_lookahead_decoding=True, lookahead_num_slots=3)
+    running = _make_seq(prompt_len=8)
+    running.status = SequenceStatus.RUNNING
+    running.block_table.append(sched.kv_cache.allocator.allocate())
+    running.output_token_ids.append(11)
+    sched.running.append(running)
+    waiting = _make_seq(prompt_len=6)
+    sched.add_seq(waiting)
+
+    out1 = sched.schedule()
+    assert out1.decode_seqs == [running]
+    assert out1.prefill_seqs == []
+
+    out2 = sched.schedule()
+    assert out2.decode_seqs == [running]
+    assert out2.prefill_seqs == []
+
+    out3 = sched.schedule()
+    assert waiting in out3.prefill_seqs
+
+
+def test_scheduler_old_waiter_breaks_decode_only_hold():
+    sched = _make_scheduler(
+        enable_lookahead_decoding=True,
+        lookahead_num_slots=4,
+        max_waiting_age_before_decode_priority_s=0.001,
+    )
+    running = _make_seq(prompt_len=8)
+    running.status = SequenceStatus.RUNNING
+    running.block_table.append(sched.kv_cache.allocator.allocate())
+    running.output_token_ids.append(11)
+    sched.running.append(running)
+    waiting = _make_seq(prompt_len=6)
+    waiting.created_time_s = time.perf_counter() - 0.01
+    sched.add_seq(waiting)
+
+    out = sched.schedule()
+
+    assert waiting in out.prefill_seqs
+
+
+def test_scheduler_adapts_prefill_chunk_size_under_decode_pressure():
+    sched = _make_scheduler(
+        enable_chunked_prefill=True,
+        max_prefill_chunk_tokens=64,
+        max_num_batched_tokens=32,
+    )
+    decode0 = _make_seq(prompt_len=8)
+    decode1 = _make_seq(prompt_len=8)
+    for seq in (decode0, decode1):
+        seq.status = SequenceStatus.RUNNING
+        seq.block_table.append(sched.kv_cache.allocator.allocate())
+        seq.output_token_ids.append(1)
+        sched.running.append(seq)
+    waiting = _make_seq(prompt_len=20)
+    sched.add_seq(waiting)
+
+    out = sched.schedule()
+
+    assert waiting in out.prefill_seqs
+    assert out.prefill_chunk_size < sched.config.max_prefill_chunk_tokens
+    assert out.total_prefill_tokens <= out.prefill_chunk_size
+
+
 def test_engine_config_accepts_prefix_cache():
     cfg = EngineConfig(enable_prefix_cache=True, prefix_cache_max_entries=16)
     assert cfg.enable_prefix_cache is True
+
+
+def test_engine_config_accepts_scheduler_hardening_knobs():
+    cfg = EngineConfig(
+        admission_window_size=16,
+        scheduler_age_bias=0.5,
+        max_waiting_age_before_decode_priority_s=0.1,
+    )
+    assert cfg.admission_window_size == 16
+
+
+def test_scheduler_estimates_admission_capacity():
+    sched = _make_scheduler(num_gpu_blocks=4, block_size=4, max_num_batched_tokens=32)
+    cap = sched.estimate_admission_capacity()
+    assert cap["admission_capacity_tokens"] == 16
+    assert cap["admission_capacity_seqs"] >= 1

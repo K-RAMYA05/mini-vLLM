@@ -14,6 +14,8 @@ import math
 
 import torch
 
+from mini_vllm.fp8 import is_fp8_dtype
+
 
 def reference_paged_attention(
     query: torch.Tensor,              # [num_seqs, num_heads, head_dim]
@@ -24,26 +26,27 @@ def reference_paged_attention(
     scale: float,
     key_scales: torch.Tensor | None = None,    # [num_blocks, num_kv_heads, block_size]
     value_scales: torch.Tensor | None = None,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
     """Returns output of shape [num_seqs, num_heads, head_dim].
 
     Handles GQA: if num_heads > num_kv_heads, Q heads are grouped so each
     group of (num_heads // num_kv_heads) shares one KV head.
 
-    If key_cache/value_cache are int8, key_scales/value_scales must be
+    If key_cache/value_cache are quantized, key_scales/value_scales must be
     provided. Dequantization happens per-token (per-(block, head, slot)).
     """
     num_seqs, num_heads, head_dim = query.shape
     num_blocks, num_kv_heads, block_size, _ = key_cache.shape
     assert num_heads % num_kv_heads == 0
     group = num_heads // num_kv_heads
-    is_int8 = key_cache.dtype == torch.int8
-    if is_int8 and (key_scales is None or value_scales is None):
-        raise ValueError("int8 reference_paged_attention requires scales")
-    out_dtype = query.dtype if not is_int8 else (key_scales.dtype)
+    is_quantized = key_cache.dtype == torch.int8 or is_fp8_dtype(key_cache.dtype)
+    if is_quantized and (key_scales is None or value_scales is None):
+        raise ValueError("quantized reference_paged_attention requires scales")
+    out_dtype = query.dtype if not is_quantized else (key_scales.dtype)
     device = query.device
 
-    out = torch.empty_like(query) if not is_int8 else torch.empty_like(query, dtype=out_dtype)
+    out = torch.empty_like(query) if not is_quantized else torch.empty_like(query, dtype=out_dtype)
 
     for s in range(num_seqs):
         ctx_len = int(context_lens[s].item())
@@ -57,7 +60,7 @@ def reference_paged_attention(
         k_chunks, v_chunks = [], []
         for bi, block_id in enumerate(block_ids):
             take = block_size if bi < n_blocks - 1 else (ctx_len - bi * block_size)
-            if is_int8:
+            if is_quantized:
                 k_int = key_cache[block_id, :, :take, :].to(torch.float32)
                 v_int = value_cache[block_id, :, :take, :].to(torch.float32)
                 k_s = key_scales[block_id, :, :take].to(torch.float32).unsqueeze(-1)
@@ -78,6 +81,9 @@ def reference_paged_attention(
         q = query[s]                                 # [num_heads, head_dim]
         # attn = softmax(q @ k^T * scale) @ v
         scores = torch.einsum("hd,hkd->hk", q, k).to(torch.float32) * scale
+        if sliding_window > 0 and ctx_len > sliding_window:
+            window_start = ctx_len - sliding_window
+            scores[:, :window_start] = float("-inf")
         probs = torch.softmax(scores, dim=-1).to(v.dtype)
         out[s] = torch.einsum("hk,hkd->hd", probs, v)
 

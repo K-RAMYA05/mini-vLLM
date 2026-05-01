@@ -6,7 +6,7 @@ across all 32 layers without recomputing block tables, context lengths, etc.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 
@@ -35,3 +35,8 @@ class AttentionMetadata:
     # Pre-built tensors consumed directly by the Triton kernel.
     decode_block_tables: torch.Tensor  # [num_decode_seqs, max_blocks] int32
     decode_context_lens: torch.Tensor  # [num_decode_seqs] int32
+    prefill_block_tables: Optional[torch.Tensor] = None  # [num_prefill_seqs, max_blocks] int32
+    # When set (>0), attention attends only to the last `sliding_window`
+    # tokens. Plumbed through to both the prefill SDPA mask and the paged
+    # decode kernel.
+    sliding_window: int = 0

@@ -1,0 +1,224 @@
+Metadata-Version: 2.4
+Name: mini-vllm
+Version: 0.1.0
+Summary: Paged KV-cache inference engine with continuous batching and paged attention.
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1.0
+Requires-Dist: triton>=2.1.0
+Requires-Dist: transformers>=4.40.0
+Requires-Dist: safetensors
+Requires-Dist: numpy
+Provides-Extra: bench
+Requires-Dist: datasets; extra == "bench"
+Requires-Dist: scipy; extra == "bench"
+Requires-Dist: httpx; extra == "bench"
+Provides-Extra: deploy
+Requires-Dist: modal; extra == "deploy"
+Provides-Extra: serve
+Requires-Dist: fastapi; extra == "serve"
+Requires-Dist: uvicorn[standard]; extra == "serve"
+Requires-Dist: pydantic; extra == "serve"
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+
+# mini_vllm
+
+A from-scratch Python + Triton reimplementation of a vLLM-style LLM serving
+stack. Current focus: single-GPU continuous batching, paged KV, chunked
+prefill, lookahead decoding, and Hopper FP8 experiments.
+
+```
+                ┌──────────────────────────────────────────────────────┐
+  request   →   │ Scheduler  →  ModelRunner  →  Attention  →  Sampler │  →  tokens
+                │   (paged KV, continuous batching, prefix cache)      │
+                └──────────────────────────────────────────────────────┘
+                          ↑                       ↑
+                          │                       │
+                 lookahead decoding         FA2 / FA3 prefill
+                 multi-step decode          Triton paged decode
+                                            int8/FP8 KV / sliding window
+```
+
+## What's inside
+
+- **Paged KV cache + block allocator** (`mini_vllm/block_manager.py`)
+- **Continuous-batching scheduler** (`mini_vllm/scheduler.py`)
+- **Chunked prefill** (`mini_vllm/model_runner.py`)
+- **Lookahead decoding** (`mini_vllm/lookahead.py`)
+  Uses a reserved multi-step decode plan instead of a top-level scheduler call
+  per token.
+- **Owned Triton packed prefill kernel with backend fallback** (`mini_vllm/attention.py`, `mini_vllm/kernels/prefill_attention.py`)
+- **Triton paged-attention decode kernel** (`mini_vllm/kernels/paged_attention.py`)
+- **GPTQ / AWQ / FP8 weight quantization** (`mini_vllm/quant/`)
+- **Int8 and Hopper-only FP8 KV cache modes** (`mini_vllm/block_manager.py`)
+- **Prefix caching with LRU and LFU eviction** (`mini_vllm/prefix_cache.py`)
+- **Sliding-window attention** (`mini_vllm/attention.py`)
+- **OpenAI-compatible HTTP server with async admission, timeouts, QoS, and backpressure** (`mini_vllm/entrypoints/openai_server.py`)
+- **Multi-LoRA serving with adapter cohorts** (`mini_vllm/lora.py`, `mini_vllm/scheduler.py`)
+- **Structured metrics + HTTP benchmark harness** (`mini_vllm/metrics.py`, `benchmarks/run_benchmark.py`)
+- **Runtime validation + stress entrypoints** (`benchmarks/validate_runtime.py`, `benchmarks/stress_async_server.py`)
+- **Modal deployment entrypoints** (`deployment/modal_serve.py`, `deployment/modal_benchmark.py`)
+
+## What Is Removed
+
+Speculative decoding and draft-model serving were removed from the runtime.
+There is no draft model path, no rejection sampling, and no speculative
+executor in the current engine.
+
+## Quick start
+
+```bash
+pip install -e ".[serve,bench,test,deploy]"
+pip install flash-attn --no-build-isolation
+python -m pytest tests/ -q
+```
+
+```python
+from mini_vllm import EngineConfig, LLMEngine, SamplingParams
+
+engine = LLMEngine(EngineConfig(
+    model_name_or_path="meta-llama/Llama-3.1-8B",
+    dtype="bfloat16",
+    num_gpu_blocks=4096,
+    max_num_seqs=16,
+    enable_chunked_prefill=True,
+    max_prefill_chunk_tokens=1024,
+    enable_lookahead_decoding=True,
+    lookahead_num_slots=4,
+    enable_prefix_cache=True,
+    prefix_cache_eviction="lfu",
+    use_quantization=True,
+    quant_method="fp8",
+    kv_cache_dtype="fp8",
+    sliding_window=4096,
+))
+engine.add_request("Explain paged attention.", SamplingParams(max_tokens=64))
+for out in engine.run_until_done():
+    print(out.output_text)
+```
+
+## OpenAI-compatible server
+
+```bash
+python -m mini_vllm.entrypoints.openai_server \
+    --model meta-llama/Llama-3.1-8B \
+    --dtype bfloat16 \
+    --num-gpu-blocks 4096 \
+    --kv-cache-dtype fp8 \
+    --prefill-backend flash3 \
+    --enable-chunked-prefill \
+    --max-prefill-chunk-tokens 1024 \
+    --enable-lookahead-decoding \
+    --lookahead-num-slots 4 \
+    --enable-prefix-cache \
+    --use-quantization \
+    --quant-method fp8 \
+    --sliding-window 4096 \
+    --host 0.0.0.0 --port 8000
+```
+
+The server now runs requests through a background engine worker with a bounded
+admission queue instead of serializing every HTTP request through a global lock.
+Use `--max-queue-size`, `--max-active-requests`, `--queue-wait-timeout-s`, and
+`--request-timeout-s` to control backpressure and request expiry. Requests can
+also set `priority` and `request_class` (`latency`, `interactive`, `default`,
+`batch`, `background`) to influence scheduler admission. Multi-LoRA adapters
+can be preloaded with repeated `--lora-adapter name=/path/to/adapter`
+arguments and selected per request with `lora_adapter`.
+
+## Benchmarking
+
+```bash
+python -m benchmarks.run_benchmark \
+    --base-url http://127.0.0.1:8000 \
+    --model meta-llama/Llama-3.1-8B \
+    --num-requests 128 \
+    --concurrency 16 \
+    --arrival-rate 8 \
+    --max-tokens 128 \
+    --mix short,medium,long
+```
+
+This harness measures TTFT, ITL, end-to-end latency, and completion-token
+throughput against the OpenAI-compatible server. It writes a structured JSON
+summary with workload metadata, percentile summaries, finish-reason counts,
+and before/after server-metrics snapshots.
+
+Use presets for reproducible hardware runs:
+
+```bash
+python -m benchmarks.run_benchmark \
+    --preset a100_single_gpu_8b \
+    --base-url http://127.0.0.1:8000 \
+    --model meta-llama/Llama-3.1-8B \
+    --output results/a100_run.json \
+    --baseline results/baselines/a100_single_gpu_8b.json
+```
+
+```bash
+python -m benchmarks.run_benchmark \
+    --preset h100_single_gpu_8b \
+    --base-url http://127.0.0.1:8000 \
+    --model meta-llama/Llama-3.1-8B \
+    --output results/h100_run.json \
+    --baseline results/baselines/h100_single_gpu_8b.json
+```
+
+## Validation
+
+```bash
+python -m benchmarks.validate_runtime --base-url http://127.0.0.1:8000
+python -m benchmarks.stress_async_server --base-url http://127.0.0.1:8000 --requests 64
+```
+
+Structured runtime metrics:
+
+```bash
+curl http://127.0.0.1:8000/metrics/structured
+```
+
+## Modal
+
+```bash
+modal serve deployment/modal_serve.py
+modal run deployment/modal_benchmark.py --base-url https://<your-modal-url>
+```
+
+## Notes
+
+- `quant_method="fp8"` and `kv_cache_dtype="fp8"` are Hopper-only and require
+  `torch.float8_e4m3fn` support.
+- FP8 KV decode now has a Triton kernel path on Hopper-capable setups. The
+  reference implementation remains the fallback for non-CUDA or non-Triton runs.
+- `enable_cuda_graphs` now captures decode-only forwards at padded batch sizes
+  from `cuda_graph_batch_sizes`, plus stable fresh-prefill chunk buckets in the
+  chunked-prefill path. Irregular/prefix-cached prefill still falls back to eager.
+- Prefill now has an owned Triton packed kernel for equal-shape fresh-prefill
+  and grouped prefix-prefill batches; unsupported shapes and CPU runs fall back
+  to the backend attention path.
+- Metrics now expose KV token/byte capacity and usage, and scheduler chunk
+  sizing factors in live KV pressure instead of only the token budget.
+- Metrics also expose queue wait, active request age, admission capacity, stage
+  timing totals, and decode/prefill graph hit counters.
+- Multi-LoRA serves one adapter cohort per scheduler step. Mixed-adapter
+  requests can share one process, but one forward pass still uses one active
+  adapter at a time.
+- Multi-LoRA currently targets dense bf16/fp16 weights. It is not wired to the
+  weight-quantized paths yet.
+
+## Limits
+
+- Single GPU only
+- One engine worker per process
+- No tensor parallelism or pipeline parallelism
+- No Medusa heads
+
+## Roadmap
+
+- [x] Triton FP8 paged-attention decode kernel
+- [x] CUDA graphs for decode and stable fresh-prefill chunks
+- [x] Owned Triton packed prefill kernel for fresh/chunked and grouped prefix prefill
+- [x] Multi-LoRA serving
+- [ ] Medusa heads
+- [x] Decode-biased scheduler with admission-window packing, aging, and adaptive prefill chunk sizing

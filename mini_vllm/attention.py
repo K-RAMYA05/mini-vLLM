@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mini_vllm.kernels import paged_attention
+from mini_vllm.kernels.prefill_attention import packed_prefill_attention
 
 
 class PagedAttention(nn.Module):
@@ -48,6 +49,7 @@ class PagedAttention(nn.Module):
         layer_idx: int,
         use_triton: bool = True,
         prefill_backend: str = "auto",
+        sliding_window: Optional[int] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -63,6 +65,7 @@ class PagedAttention(nn.Module):
         self.layer_idx = layer_idx
         self.use_triton = use_triton
         self.prefill_backend = prefill_backend
+        self.sliding_window = sliding_window
 
     def forward(
         self,
@@ -94,6 +97,10 @@ class PagedAttention(nn.Module):
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_seqs = attn_metadata.num_decode_seqs
 
+        # Per-step sliding window: metadata wins (lets engine override the
+        # configured value if needed), else fall back to the layer's value.
+        sw = getattr(attn_metadata, "sliding_window", 0) or (self.sliding_window or 0)
+
         outputs = []
 
         # ---- PREFILL path ----
@@ -108,53 +115,107 @@ class PagedAttention(nn.Module):
             # sequence that's already partially cached — it sets
             # attn_metadata._prefill_write_offset for that case.
             write_offset = getattr(attn_metadata, "_prefill_write_offset", 0)
-            for seq_info in attn_metadata.prefill_seq_infos:
-                s, e = seq_info.token_range
-                kv_cache.write_prefill(
-                    self.layer_idx,
-                    seq_info.block_table,
-                    start_pos=seq_info.start_pos + write_offset,
-                    keys=k_pre[s:e],
-                    values=v_pre[s:e],
-                )
+            if attn_metadata.prefill_block_tables is not None:
+                for row, seq_info in enumerate(attn_metadata.prefill_seq_infos):
+                    s, e = seq_info.token_range
+                    kv_cache.write_prefill_from_block_table(
+                        self.layer_idx,
+                        attn_metadata.prefill_block_tables[row],
+                        start_pos=seq_info.start_pos + write_offset,
+                        keys=k_pre[s:e],
+                        values=v_pre[s:e],
+                    )
+            else:
+                for seq_info in attn_metadata.prefill_seq_infos:
+                    s, e = seq_info.token_range
+                    kv_cache.write_prefill(
+                        self.layer_idx,
+                        seq_info.block_table,
+                        start_pos=seq_info.start_pos + write_offset,
+                        keys=k_pre[s:e],
+                        values=v_pre[s:e],
+                    )
 
-            # Run causal SDPA per-sequence. Prefill batches are typically
-            # few sequences × many tokens, so the per-seq Python overhead
-            # is negligible. (Padded batch SDPA would also work here but
-            # wastes flops on padding.)
+            # Pack the common no-prefix case by sequence length so one
+            # backend call can serve many sequences without padding. The
+            # cached-prefix case still needs its own visibility logic.
             out_prefill = torch.empty_like(q_pre)
             group = self.num_heads // self.num_kv_heads
+            packed_groups: dict[int, list] = {}
+            prefixed_groups: dict[tuple[int, int], list] = {}
             for seq_info in attn_metadata.prefill_seq_infos:
-                s, e = seq_info.token_range
-                qs = q_pre[s:e].transpose(0, 1)  # [H, T, D]
-                ks = k_pre[s:e].transpose(0, 1)  # [H_kv, T, D]
-                vs = v_pre[s:e].transpose(0, 1)
-                if group > 1:
-                    ks = ks.repeat_interleave(group, dim=0)
-                    vs = vs.repeat_interleave(group, dim=0)
                 prefix_len = seq_info.start_pos + write_offset
-                if prefix_len > 0:
+                s, e = seq_info.token_range
+                if prefix_len == 0:
+                    packed_groups.setdefault(e - s, []).append(seq_info)
+                else:
+                    prefixed_groups.setdefault((prefix_len, e - s), []).append(seq_info)
+
+            for seq_len, group_infos in packed_groups.items():
+                q_batch = torch.stack(
+                    [q_pre[s:e].transpose(0, 1) for s, e in (info.token_range for info in group_infos)],
+                    dim=0,
+                )
+                k_batch = torch.stack(
+                    [k_pre[s:e].transpose(0, 1) for s, e in (info.token_range for info in group_infos)],
+                    dim=0,
+                )
+                v_batch = torch.stack(
+                    [v_pre[s:e].transpose(0, 1) for s, e in (info.token_range for info in group_infos)],
+                    dim=0,
+                )
+                if group > 1:
+                    k_batch = k_batch.repeat_interleave(group, dim=1)
+                    v_batch = v_batch.repeat_interleave(group, dim=1)
+                packed_out = _packed_prefill_backend(
+                    q_batch,
+                    k_batch,
+                    v_batch,
+                    scale=self.scale,
+                    backend=self.prefill_backend,
+                    use_triton=self.use_triton,
+                    sliding_window=sw,
+                    prefix_len=0,
+                )
+                for batch_idx, seq_info in enumerate(group_infos):
+                    s, e = seq_info.token_range
+                    out_prefill[s:e] = packed_out[batch_idx].transpose(0, 1)
+
+            for (prefix_len, _seq_len), group_infos in prefixed_groups.items():
+                q_batch = []
+                k_batch = []
+                v_batch = []
+                for seq_info in group_infos:
+                    s, e = seq_info.token_range
+                    qs = q_pre[s:e].transpose(0, 1)
+                    ks = k_pre[s:e].transpose(0, 1)
+                    vs = v_pre[s:e].transpose(0, 1)
                     prefix_k, prefix_v = kv_cache.read_tokens(
                         self.layer_idx, seq_info.block_table, prefix_len
                     )
                     prefix_k = prefix_k.transpose(0, 1)
                     prefix_v = prefix_v.transpose(0, 1)
                     if group > 1:
+                        ks = ks.repeat_interleave(group, dim=0)
+                        vs = vs.repeat_interleave(group, dim=0)
                         prefix_k = prefix_k.repeat_interleave(group, dim=0)
                         prefix_v = prefix_v.repeat_interleave(group, dim=0)
-                    attn_out = _attention_prefill_with_prefix(
-                        qs.unsqueeze(0),
-                        torch.cat([prefix_k, ks], dim=1).unsqueeze(0),
-                        torch.cat([prefix_v, vs], dim=1).unsqueeze(0),
-                        prefix_len=prefix_len,
-                        scale=self.scale,
-                    )
-                else:
-                    attn_out = _attention_prefill(
-                        qs.unsqueeze(0), ks.unsqueeze(0), vs.unsqueeze(0),
-                        self.scale, self.prefill_backend,
-                    )
-                out_prefill[s:e] = attn_out.squeeze(0).transpose(0, 1)
+                    q_batch.append(qs)
+                    k_batch.append(torch.cat([prefix_k, ks], dim=1))
+                    v_batch.append(torch.cat([prefix_v, vs], dim=1))
+                packed_out = _packed_prefill_backend(
+                    torch.stack(q_batch, dim=0),
+                    torch.stack(k_batch, dim=0),
+                    torch.stack(v_batch, dim=0),
+                    use_triton=self.use_triton,
+                    backend=self.prefill_backend,
+                    prefix_len=prefix_len,
+                    scale=self.scale,
+                    sliding_window=sw,
+                )
+                for batch_idx, seq_info in enumerate(group_infos):
+                    s, e = seq_info.token_range
+                    out_prefill[s:e] = packed_out[batch_idx].transpose(0, 1)
             outputs.append(out_prefill)
 
         # ---- DECODE path ----
@@ -163,15 +224,13 @@ class PagedAttention(nn.Module):
             k_dec = k[num_prefill_tokens:]          # [num_decode_seqs, H_kv, D]
             v_dec = v[num_prefill_tokens:]
 
-            # Append each decode token to its sequence's current position.
-            for i, seq_info in enumerate(attn_metadata.decode_seq_infos):
-                kv_cache.write_prefill(
-                    self.layer_idx,
-                    seq_info.block_table,
-                    start_pos=seq_info.context_len - 1,  # just-added token pos
-                    keys=k_dec[i:i + 1],
-                    values=v_dec[i:i + 1],
-                )
+            kv_cache.write_decode_batch(
+                self.layer_idx,
+                attn_metadata.decode_block_tables,
+                attn_metadata.decode_context_lens,
+                k_dec,
+                v_dec,
+            )
 
             # Now read back via paged attention.
             key_layer, value_layer = kv_cache.get_kv_tensors(self.layer_idx)
@@ -188,6 +247,7 @@ class PagedAttention(nn.Module):
                 self.scale,
                 key_scales=key_scales_layer,
                 value_scales=value_scales_layer,
+                sliding_window=sw,
             )  # [num_decode_seqs, H, D]
             outputs.append(out_decode)
 
@@ -290,33 +350,83 @@ def _flash2_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
-    """Run FlashAttention-2 via the `flash_attn` package (Ampere, A100)."""
+    """Run FlashAttention-2 via the `flash_attn` package."""
     if not q.is_cuda:
-        raise RuntimeError("flash-attn backend requires CUDA tensors")
+        raise RuntimeError("flash2 backend requires CUDA tensors")
     try:
         from flash_attn import flash_attn_func
     except ImportError as exc:
         raise RuntimeError(
-            "flash-attn backend requires the `flash-attn` package "
+            "flash2 backend requires the `flash-attn` package "
             "(install with: pip install flash-attn --no-build-isolation)"
         ) from exc
+    # flash-attn 2 supports sliding window natively. (-1, -1) disables it.
+    window = (sliding_window - 1, 0) if sliding_window > 0 else (-1, -1)
     out = flash_attn_func(
         q.transpose(1, 2),
         k.transpose(1, 2),
         v.transpose(1, 2),
         causal=True,
         softmax_scale=scale,
+        window_size=window,
     )
     return out.transpose(1, 2)
 
 
+def _flash3_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    sliding_window: int = 0,
+) -> torch.Tensor:
+    """Run FlashAttention-3 via the Hopper beta package interface."""
+    if not q.is_cuda:
+        raise RuntimeError("flash3 backend requires CUDA tensors")
+    if not _is_hopper_or_newer(q):
+        raise RuntimeError(
+            "flash3 backend requires an SM90+ Hopper GPU (e.g. H100 / H200)"
+        )
+    try:
+        import flash_attn_interface
+    except ImportError as exc:
+        raise RuntimeError(
+            "flash3 backend requires the FlashAttention-3 Hopper package "
+            "(build/install from flash-attention/hopper, then import "
+            "`flash_attn_interface`)"
+        ) from exc
+    kw = {}
+    if sliding_window > 0:
+        kw["window_size"] = (sliding_window - 1, 0)
+    out = flash_attn_interface.flash_attn_func(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        causal=True,
+        softmax_scale=scale,
+        **kw,
+    )
+    return out.transpose(1, 2)
+
+
+def _cuda_sm_major(q: torch.Tensor) -> int:
+    if not q.is_cuda:
+        return -1
+    return torch.cuda.get_device_capability(q.device)[0]
+
+
 def _should_prefer_flash2(q: torch.Tensor) -> bool:
-    """True when device is Ampere or newer (SM80+). Does not check package
-    install; _flash2_attention will raise with a clear message if missing."""
+    """True when device is Ampere / Ada (SM80-SM89)."""
     if not q.is_cuda:
         return False
-    return torch.cuda.get_device_capability(q.device)[0] >= 8
+    major = _cuda_sm_major(q)
+    return 8 <= major < 9
+
+
+def _is_hopper_or_newer(q: torch.Tensor) -> bool:
+    return _cuda_sm_major(q) >= 9
 
 
 def _attention_prefill(
@@ -325,32 +435,76 @@ def _attention_prefill(
     v: torch.Tensor,
     scale: float,
     backend: str,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
-    """Run causal prefill attention with flash-attn v2 or PyTorch SDPA.
+    """Run causal prefill attention with FlashAttention or PyTorch SDPA.
 
     q/k/v use PyTorch SDPA layout [B, H, T, D]. The flash-attn package uses
     [B, T, H, D], so this wrapper keeps the call sites backend-agnostic.
 
     Strict device routing (no silent fallback):
-      - 'flash_attn': FA2 via `flash_attn` package.
-      - 'flash'     : FA2 on Ampere+ CUDA; raises on other CUDA devices / CPU.
-      - 'auto'      : FA2 on CUDA SM80+; falls back to SDPA on CPU.
+      - 'flash2' / 'flash_attn': FA2 via `flash_attn` package.
+      - 'flash3'    : FA3 via `flash_attn_interface` on Hopper+ CUDA.
+      - 'flash'     : FA3 on Hopper+, FA2 on Ampere/Ada; raises elsewhere.
+      - 'auto'      : same as today for CPU fallback, but prefers FA3 on
+                      Hopper and FA2 on Ampere/Ada.
       - other       : PyTorch SDPA with the requested kernel.
     """
-    if backend == "flash_attn":
-        return _flash2_attention(q, k, v, scale)
+    if backend in ("flash2", "flash_attn"):
+        return _flash2_attention(q, k, v, scale, sliding_window=sliding_window)
+
+    if backend == "flash3":
+        return _flash3_attention(q, k, v, scale, sliding_window=sliding_window)
 
     if backend in ("flash", "auto"):
+        if _is_hopper_or_newer(q):
+            try:
+                return _flash3_attention(q, k, v, scale, sliding_window=sliding_window)
+            except RuntimeError:
+                if backend == "flash":
+                    return _sdpa_with_window(q, k, v, scale, sliding_window, sdpa_kind="flash")
         if _should_prefer_flash2(q):
-            return _flash2_attention(q, k, v, scale)
+            try:
+                return _flash2_attention(q, k, v, scale, sliding_window=sliding_window)
+            except RuntimeError:
+                return _sdpa_with_window(q, k, v, scale, sliding_window, sdpa_kind="flash")
         if backend == "flash":
             raise RuntimeError(
-                "prefill_attention_backend='flash' requires an SM80+ CUDA GPU "
-                "(e.g. A100). Use 'math' or 'mem_efficient' for CPU / pre-Ampere."
+                "prefill_attention_backend='flash' requires an SM80+ CUDA GPU. "
+                "Use Ampere/Ada for flash2 or Hopper for flash3. Use 'math' "
+                "or 'mem_efficient' for CPU / pre-Ampere."
             )
 
-    with _sdpa_backend(backend):
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+    return _sdpa_with_window(q, k, v, scale, sliding_window, sdpa_kind=backend)
+
+
+def _sdpa_with_window(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    sliding_window: int,
+    sdpa_kind: str,
+) -> torch.Tensor:
+    """SDPA path with optional sliding-window mask.
+
+    PyTorch SDPA doesn't take a window arg; build a banded causal mask when
+    sliding_window>0. With sliding_window=0 we use is_causal=True so the
+    fast paths (flash, mem-efficient) can fire.
+    """
+    if sliding_window <= 0:
+        with _sdpa_backend(sdpa_kind):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+    q_len = q.shape[-2]
+    k_len = k.shape[-2]
+    pos_q = torch.arange(q_len, device=q.device).unsqueeze(-1)        # [Q, 1]
+    pos_k = torch.arange(k_len, device=q.device).unsqueeze(0)         # [1, K]
+    delta = pos_q - pos_k
+    mask = (delta >= 0) & (delta < sliding_window)
+    bias = torch.zeros((q_len, k_len), dtype=q.dtype, device=q.device)
+    bias.masked_fill_(~mask, float("-inf"))
+    with _sdpa_backend("math" if sdpa_kind in ("flash", "auto") else sdpa_kind):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=bias, is_causal=False, scale=scale)
 
 
 def _attention_prefill_with_prefix(
@@ -359,11 +513,47 @@ def _attention_prefill_with_prefix(
     v: torch.Tensor,
     prefix_len: int,
     scale: float,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
     """Run prefill attention when the sequence already has cached prefix KV."""
     _, _, q_len, _ = q.shape
     total_k = k.shape[2]
     mask = torch.full((q_len, total_k), float("-inf"), dtype=q.dtype, device=q.device)
     for row in range(q_len):
-        mask[row, : prefix_len + row + 1] = 0
+        visible = prefix_len + row + 1
+        start = 0
+        if sliding_window > 0:
+            start = max(0, visible - sliding_window)
+        mask[row, start:visible] = 0
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False, scale=scale)
+
+
+def _packed_prefill_backend(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    backend: str,
+    use_triton: bool,
+    sliding_window: int = 0,
+    prefix_len: int = 0,
+) -> torch.Tensor:
+    if use_triton:
+        return packed_prefill_attention(
+            q,
+            k,
+            v,
+            scale=scale,
+            prefix_len=prefix_len,
+            sliding_window=sliding_window,
+        )
+    if prefix_len > 0:
+        return _attention_prefill_with_prefix(
+            q,
+            k,
+            v,
+            prefix_len=prefix_len,
+            scale=scale,
+            sliding_window=sliding_window,
+        )
+    return _attention_prefill(q, k, v, scale, backend, sliding_window=sliding_window)

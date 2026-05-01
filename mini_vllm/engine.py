@@ -23,6 +23,9 @@ import torch
 
 from mini_vllm.block_manager import KVCache
 from mini_vllm.config import EngineConfig
+from mini_vllm.fp8 import require_hopper_fp8
+from mini_vllm.lookahead import LookaheadExecutor
+from mini_vllm.lora import apply_lora_adapters
 from mini_vllm.model_loader import load_model
 from mini_vllm.model_runner import ModelRunner
 from mini_vllm.metrics import EngineMetrics
@@ -41,6 +44,8 @@ _DTYPE_MAP = {
 class LLMEngine:
     def __init__(self, config: EngineConfig):
         self.config = config
+        if config.kv_cache_dtype == "fp8" or (config.use_quantization and config.quant_method == "fp8"):
+            require_hopper_fp8(config.device, what="FP8 weights/KV")
         if config.tensor_parallel_size != 1 or config.pipeline_parallel_size != 1:
             raise NotImplementedError(
                 "tensor_parallel_size and pipeline_parallel_size are config placeholders; "
@@ -59,20 +64,54 @@ class LLMEngine:
             device=config.device,
             use_triton=config.use_triton_attention,
             prefill_backend=config.prefill_attention_backend,
+            sliding_window=config.sliding_window,
             trust_remote_code=config.trust_remote_code,
         )
+        self.lora_manager = None
+        if config.lora_adapters:
+            if config.use_quantization:
+                raise NotImplementedError(
+                    "Multi-LoRA currently targets dense bf16/fp16 weights. "
+                    "Disable use_quantization when loading LoRA adapters."
+                )
+            self.logger.info("Loading LoRA adapters: %s", ", ".join(config.lora_adapters))
+            self.lora_manager = apply_lora_adapters(self.model, config.lora_adapters)
 
         # Optional weight-only GPTQ quantization, applied post-load so the HF loader
         # doesn't have to understand our format.
         if config.use_quantization:
-            from mini_vllm.quant import apply_gptq_quantization
-            self.logger.info(f"Quantizing weights to {config.quant_bits}-bit GPTQ ...")
-            apply_gptq_quantization(
-                self.model,
-                bits=config.quant_bits,
-                group_size=config.quant_group_size,
-                tokenizer=self.tokenizer,
+            from mini_vllm.quant import (
+                apply_awq_quantization,
+                apply_fp8_quantization,
+                apply_gptq_quantization,
             )
+
+            if config.quant_method == "awq":
+                quant_fn = apply_awq_quantization
+            elif config.quant_method == "fp8":
+                quant_fn = apply_fp8_quantization
+            else:
+                quant_fn = apply_gptq_quantization
+            self.logger.info(
+                (
+                    "Quantizing weights to FP8 ..."
+                    if config.quant_method == "fp8"
+                    else f"Quantizing weights to {config.quant_bits}-bit {config.quant_method.upper()} ..."
+                )
+            )
+            if config.quant_method == "fp8":
+                quant_fn(
+                    self.model,
+                    group_size=config.quant_group_size,
+                    tokenizer=self.tokenizer,
+                )
+            else:
+                quant_fn(
+                    self.model,
+                    bits=config.quant_bits,
+                    group_size=config.quant_group_size,
+                    tokenizer=self.tokenizer,
+                )
 
         self.kv_cache = KVCache(
             num_layers=self.info["num_layers"],
@@ -88,13 +127,11 @@ class LLMEngine:
 
         self.metrics = EngineMetrics()
         self.scheduler = Scheduler(config, self.kv_cache, metrics=self.metrics)
-        self.runner = ModelRunner(config, self.model, self.kv_cache, self.info)
+        self.runner = ModelRunner(config, self.model, self.kv_cache, self.info, metrics=self.metrics)
 
-        # Speculative decoding (optional).
-        self.spec_executor = None
-        if config.use_speculative:
-            from mini_vllm.speculative.spec_decode import SpeculativeExecutor
-            self.spec_executor = SpeculativeExecutor(config, self)
+        self.lookahead_executor = (
+            LookaheadExecutor(self) if config.enable_lookahead_decoding else None
+        )
 
         self.finished_outputs: List[RequestOutput] = []
 
@@ -104,6 +141,9 @@ class LLMEngine:
         self,
         prompt: str,
         sampling_params: Optional[SamplingParams] = None,
+        priority: int = 0,
+        request_class: str = "default",
+        lora_adapter_name: str | None = None,
     ) -> int:
         """Queue a generation request. Returns the seq_id."""
         if sampling_params is None:
@@ -113,6 +153,9 @@ class LLMEngine:
             prompt=prompt,
             prompt_token_ids=token_ids,
             sampling_params=sampling_params,
+            priority=priority,
+            request_class=request_class,
+            lora_adapter_name=lora_adapter_name,
         )
         self.scheduler.add_seq(seq)
         self.metrics.request_started()
@@ -127,27 +170,17 @@ class LLMEngine:
         if outputs.is_empty:
             return []
         self.metrics.observe_step(
-            prefill_tokens=sum(s.num_prompt_tokens for s in outputs.prefill_seqs),
+            prefill_tokens=outputs.total_prefill_tokens,
             decode_tokens=len(outputs.decode_seqs),
         )
+        if self.lora_manager is not None:
+            self.lora_manager.set_active_adapter(outputs.adapter_name)
 
-        if self.spec_executor is not None and outputs.decode_seqs and not outputs.prefill_seqs:
-            # Speculative decode path (decode-only steps). Prefill goes
-            # through the normal runner.
-            sampled_per_seq = self.spec_executor.step(outputs.decode_seqs)
-            # sampled_per_seq: List[List[int]] — accepted tokens per seq
-            all_seqs = outputs.prefill_seqs + outputs.decode_seqs
-            # prefill is empty here, so index aligns with decode_seqs.
-            for seq, tokens in zip(outputs.decode_seqs, sampled_per_seq):
-                for tok in tokens:
-                    seq.append_output_token(tok)
-                    self._observe_generated_token(seq)
-                    if seq.check_stop(self.info["eos_token_id"]):
-                        break
+        if self.lookahead_executor is not None and outputs.decode_seqs and not outputs.prefill_seqs:
+            self.lookahead_executor.step(outputs.decode_seqs)
         else:
             sampled = self.runner.execute(outputs)
-            all_seqs = outputs.prefill_seqs + outputs.decode_seqs
-            for seq, tok in zip(all_seqs, sampled):
+            for seq, tok in zip(outputs.prefill_seqs + outputs.decode_seqs, sampled):
                 seq.append_output_token(tok)
                 self._observe_generated_token(seq)
                 seq.check_stop(self.info["eos_token_id"])
@@ -199,6 +232,9 @@ class LLMEngine:
 
     def get_metrics(self) -> dict:
         return self.metrics.snapshot(kv_cache=self.kv_cache, scheduler=self.scheduler)
+
+    def get_metrics_structured(self) -> dict:
+        return self.metrics.structured_snapshot(kv_cache=self.kv_cache, scheduler=self.scheduler)
 
     def get_prometheus_metrics(self) -> str:
         return self.metrics.prometheus(kv_cache=self.kv_cache, scheduler=self.scheduler)

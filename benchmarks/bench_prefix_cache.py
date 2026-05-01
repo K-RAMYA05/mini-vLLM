@@ -80,7 +80,11 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--num-gpu-blocks", type=int, default=8192)
-    p.add_argument("--prefill-backend", default="flash", choices=["auto", "flash", "flash_attn", "mem_efficient", "math"])
+    p.add_argument(
+        "--prefill-backend",
+        default="flash",
+        choices=["auto", "flash", "flash2", "flash3", "flash_attn", "mem_efficient", "math"],
+    )
     p.add_argument("--no-triton", action="store_true")
     args = p.parse_args()
 

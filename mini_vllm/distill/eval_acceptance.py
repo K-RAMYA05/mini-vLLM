@@ -1,7 +1,7 @@
-"""Evaluate draft-model acceptance rate for speculative decoding.
+"""Evaluate draft-model acceptance rate for the legacy draft/verify pipeline.
 
 Measures α — the fraction of draft tokens accepted by the target during
-rejection sampling — on a held-out eval set. Reports:
+the acceptance walk — on a held-out eval set. Reports:
   - Overall α (averaged across positions and sequences).
   - Per-domain α (natural text vs. code), if both domains are present.
   - Expected tokens-per-step = (1 - α^{γ+1}) / (1 - α), and implied latency

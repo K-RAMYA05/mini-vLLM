@@ -38,17 +38,21 @@ class Sequence:
     prompt: str
     prompt_token_ids: List[int]
     sampling_params: SamplingParams
+    priority: int = 0
+    request_class: str = "default"
+    lora_adapter_name: str | None = None
     seq_id: int = field(default_factory=lambda: next(_seq_id_counter))
     output_token_ids: List[int] = field(default_factory=list)
     status: SequenceStatus = SequenceStatus.WAITING
     block_table: BlockTable = field(default_factory=BlockTable)
     created_time_s: float = field(default_factory=time.perf_counter)
+    admitted_time_s: Optional[float] = None
     first_token_time_s: Optional[float] = None
     last_token_time_s: Optional[float] = None
 
     # Number of tokens already committed into the KV cache. During prefill
-    # this jumps from 0 to len(prompt); during decode it increments by 1
-    # (or by the number of accepted draft tokens under speculative decoding).
+    # this jumps from 0 to len(prompt); during decode it increments as new
+    # tokens are appended, including multi-substep lookahead decode.
     num_cached_tokens: int = 0
     prefix_cache_blocks: int = 0
 

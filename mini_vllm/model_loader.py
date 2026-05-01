@@ -24,6 +24,7 @@ def load_model(
     device: torch.device | str,
     use_triton: bool,
     prefill_backend: str = "auto",
+    sliding_window: int | None = None,
     trust_remote_code: bool = False,
 ) -> Tuple[nn.Module, "AutoTokenizer", dict]:
     """Returns (model, tokenizer, model_info_dict)."""
@@ -62,6 +63,7 @@ def load_model(
             layer_idx=layer_idx,
             use_triton=use_triton,
             prefill_backend=prefill_backend,
+            sliding_window=sliding_window,
         )
         layer.self_attn = paged
 

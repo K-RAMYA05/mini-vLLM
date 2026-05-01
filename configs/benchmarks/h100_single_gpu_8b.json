@@ -1,0 +1,8 @@
+{
+  "mix": "short,medium,long",
+  "num_requests": 160,
+  "concurrency": 24,
+  "arrival_rate": 10.0,
+  "max_tokens": 128,
+  "seed": 0
+}

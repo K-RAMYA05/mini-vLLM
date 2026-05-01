@@ -35,13 +35,13 @@ to -inf before softmax.
 Limitations (by design, for research-grade):
   - decode only (query_len == 1 per sequence). Prefill uses a separate path.
   - head_dim must be a power of two ≤ 128 (64 and 128 are what Llama uses).
-  - one query per sequence; speculative-decode verify uses a batched
-    wrapper that tiles the γ+1 query tokens as γ+1 separate "sequences"
-    sharing a block table.
+  - one query per sequence.
 """
 from __future__ import annotations
 
 import torch
+
+from mini_vllm.fp8 import is_fp8_dtype
 
 try:
     import triton
@@ -61,7 +61,7 @@ if _HAS_TRITON:
         v_cache_ptr,          # [num_blocks, num_kv_heads, block_size, head_dim]
         block_tables_ptr,     # [num_seqs, max_num_blocks_per_seq] int32
         context_lens_ptr,     # [num_seqs] int32
-        # int8 mode only (else nullptr-equivalent); per-(block, kv_head, slot) scales:
+        # quantized modes only (else nullptr-equivalent); per-(block, kv_head, slot) scales:
         k_scales_ptr,         # [num_blocks, num_kv_heads, block_size]
         v_scales_ptr,         # [num_blocks, num_kv_heads, block_size]
         scale,
@@ -80,6 +80,8 @@ if _HAS_TRITON:
         BLOCK_SIZE: tl.constexpr,
         MAX_NUM_BLOCKS_PER_SEQ: tl.constexpr,
         KV_INT8: tl.constexpr,
+        KV_FP8: tl.constexpr,
+        SLIDING_WINDOW: tl.constexpr,
     ):
         seq_idx = tl.program_id(0)
         head_idx = tl.program_id(1)
@@ -104,9 +106,18 @@ if _HAS_TRITON:
 
         t_range = tl.arange(0, BLOCK_SIZE)                       # within-block token offs
 
+        # Sliding-window: the earliest position the kernel is allowed to
+        # attend to. 0 (or SLIDING_WINDOW=0) means full causal context.
+        if SLIDING_WINDOW > 0:
+            window_start = tl.maximum(ctx_len - SLIDING_WINDOW, 0)
+            first_blk = window_start // BLOCK_SIZE
+        else:
+            window_start = 0
+            first_blk = 0
+
         num_blocks = (ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-        for blk in range(0, num_blocks):
+        for blk in range(first_blk, num_blocks):
             # Physical block id for this logical block.
             physical_block = tl.load(block_tables_ptr + seq_idx * bt_stride_s + blk)
 
@@ -114,6 +125,9 @@ if _HAS_TRITON:
             block_start_pos = blk * BLOCK_SIZE
             valid = tl.minimum(BLOCK_SIZE, ctx_len - block_start_pos)
             mask_t = t_range < valid                             # [BLOCK_SIZE]
+            if SLIDING_WINDOW > 0:
+                # Mask out positions before window_start within this block.
+                mask_t = mask_t & ((block_start_pos + t_range) >= window_start)
 
             # ---- load K block: [BLOCK_SIZE, HEAD_DIM] ----
             k_base = (
@@ -131,6 +145,15 @@ if _HAS_TRITON:
                 )
                 k_scale = tl.load(k_scales_ptr + k_scale_off, mask=mask_t, other=0.0).to(tl.float32)
                 k = k_int * k_scale[:, None]
+            elif KV_FP8:
+                k_fp8 = tl.load(k_cache_ptr + k_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
+                k_scale_off = (
+                    physical_block * ks_stride_b
+                    + kv_head_idx * ks_stride_h
+                    + t_range
+                )
+                k_scale = tl.load(k_scales_ptr + k_scale_off, mask=mask_t, other=0.0).to(tl.float32)
+                k = k_fp8 * k_scale[:, None]
             else:
                 k = tl.load(k_cache_ptr + k_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
 
@@ -160,6 +183,15 @@ if _HAS_TRITON:
                 )
                 v_scale = tl.load(v_scales_ptr + v_scale_off, mask=mask_t, other=0.0).to(tl.float32)
                 v = v_int * v_scale[:, None]
+            elif KV_FP8:
+                v_fp8 = tl.load(v_cache_ptr + v_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
+                v_scale_off = (
+                    physical_block * vs_stride_b
+                    + kv_head_idx * vs_stride_h
+                    + t_range
+                )
+                v_scale = tl.load(v_scales_ptr + v_scale_off, mask=mask_t, other=0.0).to(tl.float32)
+                v = v_fp8 * v_scale[:, None]
             else:
                 v = tl.load(v_cache_ptr + v_base, mask=mask_t[:, None], other=0.0).to(tl.float32)
 
@@ -182,21 +214,27 @@ def paged_attention(
     scale: float,
     key_scales: torch.Tensor | None = None,    # [num_blocks, num_kv_heads, block_size] (int8 only)
     value_scales: torch.Tensor | None = None,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
     """Triton paged attention. Falls back to reference if Triton isn't present.
 
-    When key_cache/value_cache are int8, key_scales and value_scales must be
-    provided; the kernel dequantizes per-token in registers.
+    When key_cache/value_cache are quantized, key_scales and value_scales must
+    be provided. INT8 and FP8 dequantization are fused in the Triton kernel.
+
+    sliding_window>0 restricts attention to the last `sliding_window` tokens
+    of each sequence; 0 means full causal context.
     """
     is_int8 = key_cache.dtype == torch.int8
-    if is_int8 and (key_scales is None or value_scales is None):
-        raise ValueError("int8 paged_attention requires key_scales and value_scales")
+    is_fp8 = is_fp8_dtype(key_cache.dtype)
+    if (is_int8 or is_fp8) and (key_scales is None or value_scales is None):
+        raise ValueError("quantized paged_attention requires key_scales and value_scales")
 
     if not _HAS_TRITON or not query.is_cuda:
         from mini_vllm.kernels.reference_attention import reference_paged_attention
         return reference_paged_attention(
             query, key_cache, value_cache, block_tables, context_lens, scale,
             key_scales=key_scales, value_scales=value_scales,
+            sliding_window=sliding_window,
         )
 
     num_seqs, num_heads, head_dim = query.shape
@@ -207,7 +245,7 @@ def paged_attention(
 
     out = torch.empty_like(query)
 
-    if is_int8:
+    if is_int8 or is_fp8:
         ks_b, ks_h = key_scales.stride(0), key_scales.stride(1)
         vs_b, vs_h = value_scales.stride(0), value_scales.stride(1)
         ks_ptr, vs_ptr = key_scales, value_scales
@@ -235,5 +273,7 @@ def paged_attention(
         BLOCK_SIZE=block_size,
         MAX_NUM_BLOCKS_PER_SEQ=max_num_blocks,
         KV_INT8=is_int8,
+        KV_FP8=is_fp8,
+        SLIDING_WINDOW=int(sliding_window),
     )
     return out

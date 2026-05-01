@@ -1,8 +1,7 @@
 """Tests for the Tier-1 novelty additions:
    - LFU vs LRU prefix-cache eviction
    - int8 KV cache write+read round-trip
-   - adaptive-γ selection in SpeculativeExecutor
-   - Leviathan-formula helper used by the sweep analyzer
+   - lookahead decode advances multiple substeps
 """
 from __future__ import annotations
 
@@ -10,8 +9,13 @@ import torch
 
 from mini_vllm.block_manager import BlockTable, KVCache
 from mini_vllm.config import EngineConfig
-from mini_vllm.distill.analyze_sweep import leviathan_tokens_per_step
+from mini_vllm.lookahead import LookaheadExecutor
+from mini_vllm.model_runner import ModelRunner
 from mini_vllm.prefix_cache import PrefixCache
+from mini_vllm.quant.awq import _quantize_linear_awq
+from mini_vllm.quant.gptq import GPTQLinear
+from mini_vllm.sampling import SamplingParams
+from mini_vllm.sequence import Sequence
 
 
 # ------------------------------------------------------------------
@@ -117,6 +121,18 @@ def test_kv_cache_dtype_validation():
         EngineConfig(kv_cache_dtype="fp4")
 
 
+def test_engine_config_accepts_fp8_kv_and_quant_method():
+    cfg = EngineConfig(kv_cache_dtype="fp8", quant_method="fp8")
+    assert cfg.kv_cache_dtype == "fp8"
+    assert cfg.quant_method == "fp8"
+
+
+def test_engine_config_validates_cuda_graph_batch_sizes():
+    import pytest
+    with pytest.raises(ValueError, match="cuda_graph_batch_sizes"):
+        EngineConfig(enable_cuda_graphs=True, cuda_graph_batch_sizes=())
+
+
 def test_int8_kv_cache_storage_is_actually_int8():
     kvc = KVCache(
         num_layers=1, num_kv_heads=1, head_dim=4,
@@ -131,96 +147,152 @@ def test_int8_kv_cache_storage_is_actually_int8():
 
 
 # ------------------------------------------------------------------
-# Adaptive γ
+# Lookahead decoding
 # ------------------------------------------------------------------
 
-def test_adaptive_gamma_picks_warmstart_for_unseen_seq():
-    """Without touching real models, exercise just _select_gamma logic by
-    constructing a SpeculativeExecutor-like stub."""
-
-    class Stub:
-        adaptive_gamma = True
-        gamma = 4
-        gamma_min = 1
-        gamma_max = 8
-        gamma_alpha = 0.3
-        _accept_ewma: dict = {}
-
-        # bind the real method
-        from mini_vllm.speculative.spec_decode import SpeculativeExecutor
-        _select_gamma = SpeculativeExecutor._select_gamma
-
-    class FakeSeq:
-        seq_id = 1
-
-    stub = Stub()
-    stub._accept_ewma = {}
-    g = stub._select_gamma(FakeSeq())
-    assert g == 4   # warm start to self.gamma
-
-
-def test_adaptive_gamma_high_acceptance_picks_max():
-    from mini_vllm.speculative.spec_decode import SpeculativeExecutor
-
-    class Stub:
-        adaptive_gamma = True
-        gamma = 4
-        gamma_min = 1
-        gamma_max = 8
-        gamma_alpha = 0.3
-
-    class FakeSeq:
-        seq_id = 7
-
-    stub = Stub()
-    stub._accept_ewma = {7: 1.0}   # perfect acceptance
-    g = SpeculativeExecutor._select_gamma(stub, FakeSeq())
-    assert g == 8
-
-
-def test_adaptive_gamma_low_acceptance_picks_min():
-    from mini_vllm.speculative.spec_decode import SpeculativeExecutor
-
-    class Stub:
-        adaptive_gamma = True
-        gamma = 4
-        gamma_min = 1
-        gamma_max = 8
-        gamma_alpha = 0.3
-
-    class FakeSeq:
-        seq_id = 7
-
-    stub = Stub()
-    stub._accept_ewma = {7: 0.0}   # nothing ever accepted
-    g = SpeculativeExecutor._select_gamma(stub, FakeSeq())
-    assert g == 1
-
-
-def test_engine_config_validates_adaptive_bounds():
+def test_engine_config_validates_lookahead_bounds():
     import pytest
-    with pytest.raises(ValueError, match="spec_gamma_min"):
+    with pytest.raises(ValueError, match="lookahead_num_slots"):
         EngineConfig(
-            use_speculative=True, draft_model_name_or_path="x",
-            spec_adaptive_gamma=True, spec_gamma_min=5, spec_gamma_max=2,
+            enable_lookahead_decoding=True,
+            lookahead_num_slots=1,
         )
 
 
+def test_lookahead_executor_advances_multiple_decode_substeps():
+    class StubScheduler:
+        def _append_slot_if_needed(self, seq):
+            return True
+
+    class StubRunner:
+        def execute_decode_plan(self, seqs, num_steps, eos_token_id):
+            assert num_steps == 3
+            return [[11, 12, 13] for _ in seqs]
+
+    class StubKVCache:
+        class Alloc:
+            @staticmethod
+            def can_allocate(n):
+                return True
+
+            @staticmethod
+            def allocate():
+                return 99
+
+        allocator = Alloc()
+
+        @staticmethod
+        def num_blocks_needed(seq_len):
+            return 1
+
+    class StubEngine:
+        config = EngineConfig(enable_lookahead_decoding=True, lookahead_num_slots=3, device="cpu")
+        scheduler = StubScheduler()
+        runner = StubRunner()
+        kv_cache = StubKVCache()
+        info = {"eos_token_id": None}
+
+        def _observe_generated_token(self, seq):
+            pass
+
+    seq = Sequence(
+        prompt="x",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=3, temperature=0.0),
+    )
+
+    LookaheadExecutor(StubEngine()).step([seq])
+    assert seq.output_token_ids == [11, 12, 13]
+    assert seq.finish_reason == "length"
+
+
 # ------------------------------------------------------------------
-# Leviathan formula
+# Chunked prefill + sliding window
 # ------------------------------------------------------------------
 
-def test_leviathan_alpha_zero_gives_one_token_per_step():
-    assert leviathan_tokens_per_step(0.0, gamma=4) == 1.0
+def test_chunked_prefill_splits_long_prompt_and_updates_cache_count():
+    class StubRunner:
+        config = EngineConfig(
+            enable_chunked_prefill=True,
+            max_prefill_chunk_tokens=3,
+            sliding_window=64,
+            device="cpu",
+        )
+        device = torch.device("cpu")
+        _execute_chunked_prefill = ModelRunner._execute_chunked_prefill
+        _run_prefill_chunk = ModelRunner._run_prefill_chunk
+        _sample = ModelRunner._sample
+
+        def __init__(self):
+            self.calls = []
+            self.generator = torch.Generator(device=self.device).manual_seed(0)
+
+        def _forward(self, input_ids, position_ids, attn_metadata):
+            self.calls.append({
+                "input_ids": input_ids.tolist(),
+                "position_ids": position_ids.tolist(),
+                "sliding_window": attn_metadata.sliding_window,
+            })
+            vocab = 32
+            logits = torch.full((input_ids.shape[0], vocab), -1e9, device=input_ids.device)
+            logits[:, input_ids.shape[0]] = 0.0
+            return logits
+
+    seq = Sequence(
+        prompt="x",
+        prompt_token_ids=list(range(7)),
+        sampling_params=SamplingParams(max_tokens=8, temperature=0.0),
+    )
+    seq.block_table.append(0)
+    seq.block_table.append(1)
+
+    runner = StubRunner()
+    sampled = runner._execute_chunked_prefill([seq])
+
+    assert [call["input_ids"] for call in runner.calls] == [[0, 1, 2], [3, 4, 5], [6]]
+    assert [call["position_ids"] for call in runner.calls] == [[0, 1, 2], [3, 4, 5], [6]]
+    assert all(call["sliding_window"] == 64 for call in runner.calls)
+    assert seq.num_cached_tokens == 7
+    assert sampled == [1]
 
 
-def test_leviathan_alpha_one_gives_gamma_plus_one():
-    assert leviathan_tokens_per_step(1.0, gamma=4) == 5.0
+def test_run_prefill_chunk_uses_graph_helper_when_available():
+    class StubRunner:
+        config = EngineConfig(enable_cuda_graphs=True, device="cpu")
+        device = torch.device("cpu")
+        _run_prefill_chunk = ModelRunner._run_prefill_chunk
+
+        def _execute_prefill_graph_single(self, seq, token_ids):
+            return torch.ones((len(token_ids), 8), dtype=torch.float32)
+
+        def _forward(self, input_ids, position_ids, attn_metadata):
+            raise AssertionError("eager prefill path should not run when graph helper succeeds")
+
+    seq = Sequence(
+        prompt="x",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=4, temperature=0.0),
+    )
+    seq.block_table.append(0)
+
+    runner = StubRunner()
+    runner._graph_enabled = True
+    out = runner._run_prefill_chunk(seq, [1, 2, 3], start_pos=0)
+
+    assert out.shape == (3, 8)
 
 
-def test_leviathan_monotonic_in_alpha():
-    prev = -1.0
-    for a in [0.1, 0.3, 0.5, 0.7, 0.9]:
-        cur = leviathan_tokens_per_step(a, gamma=4)
-        assert cur > prev
-        prev = cur
+# ------------------------------------------------------------------
+# AWQ
+# ------------------------------------------------------------------
+
+def test_awq_quantizes_linear_to_gptqlinear_runtime_module():
+    lin = torch.nn.Linear(8, 4, bias=True)
+    act = torch.linspace(0.5, 1.5, steps=8)
+    q = _quantize_linear_awq(lin, activation_mean_abs=act, bits=4, group_size=4)
+
+    assert isinstance(q, GPTQLinear)
+    assert q.bits == 4
+    x = torch.randn(2, 8)
+    out = q(x)
+    assert out.shape == (2, 4)

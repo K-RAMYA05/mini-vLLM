@@ -1,6 +1,6 @@
 """Aggregate the results of a draft-depth sweep.
 
-Reads eval_<D>layer.json files produced by scripts/sweep_draft_depth.sh, then
+Reads eval_<D>layer.json files from a depth sweep run, then
 emits a markdown report with:
 
   - Per-depth, per-domain α (acceptance rate).

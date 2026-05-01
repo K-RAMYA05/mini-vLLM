@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from mini_vllm.block_manager import BlockAllocator, BlockTable, build_block_tables_tensor
+from mini_vllm.fp8 import has_hopper_fp8
 from mini_vllm.kernels import paged_attention, reference_paged_attention
 
 
@@ -20,6 +21,11 @@ except ImportError:
 skip_if_no_cuda_triton = pytest.mark.skipif(
     not (CUDA_AVAILABLE and TRITON_AVAILABLE),
     reason="CUDA + Triton required",
+)
+
+skip_if_no_hopper_fp8 = pytest.mark.skipif(
+    not has_hopper_fp8("cuda"),
+    reason="Hopper FP8 support required",
 )
 
 
@@ -38,10 +44,11 @@ def _build_random_paged_cache(
             bt.append(allocator.allocate())
         block_tables.append(bt)
 
+    base_dtype = torch.float16 if dtype == getattr(torch, "float8_e4m3fn", None) else dtype
     k_cache = torch.randn(
-        (1024, num_kv_heads, block_size, head_dim), dtype=dtype, device=device
-    )
-    v_cache = torch.randn_like(k_cache)
+        (1024, num_kv_heads, block_size, head_dim), dtype=base_dtype, device=device
+    ).to(dtype)
+    v_cache = torch.randn_like(k_cache, dtype=base_dtype).to(dtype)
 
     max_blocks = max(len(bt) for bt in block_tables)
     bt_tensor = build_block_tables_tensor(block_tables, max_blocks, device)
@@ -87,3 +94,35 @@ def test_triton_empty_context():
     q = torch.randn(1, 2, 64, dtype=dtype, device=device)
     out = paged_attention(q, k_cache, v_cache, bt, ctx, 64 ** -0.5)
     assert torch.all(out == 0)
+
+
+@skip_if_no_cuda_triton
+@skip_if_no_hopper_fp8
+def test_triton_fp8_kv_matches_reference():
+    torch.manual_seed(0)
+    device = "cuda"
+    num_seqs = 4
+    num_kv_heads = 8
+    num_heads = 32
+    head_dim = 64
+    block_size = 16
+    seq_lens = [5, 16, 33, 47]
+    fp8_dtype = torch.float8_e4m3fn
+
+    k_cache, v_cache, bt, ctx = _build_random_paged_cache(
+        num_seqs, num_kv_heads, head_dim, block_size, seq_lens, fp8_dtype, device,
+    )
+    key_scales = torch.rand((1024, num_kv_heads, block_size), dtype=torch.float16, device=device) * 0.1 + 0.01
+    value_scales = torch.rand((1024, num_kv_heads, block_size), dtype=torch.float16, device=device) * 0.1 + 0.01
+    q = torch.randn(num_seqs, num_heads, head_dim, dtype=torch.float16, device=device)
+    scale = head_dim ** -0.5
+
+    out_ref = reference_paged_attention(
+        q, k_cache, v_cache, bt, ctx, scale,
+        key_scales=key_scales, value_scales=value_scales,
+    )
+    out_triton = paged_attention(
+        q, k_cache, v_cache, bt, ctx, scale,
+        key_scales=key_scales, value_scales=value_scales,
+    )
+    torch.testing.assert_close(out_triton, out_ref, rtol=2e-2, atol=2e-2)

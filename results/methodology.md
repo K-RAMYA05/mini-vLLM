@@ -88,22 +88,12 @@ head counts are preserved).
 
 ## Reproducing
 
-```bash
-DATA_DIR=/scratch1/$USER/mini_vllm/distill_data \
-OUT_ROOT=/scratch1/$USER/mini_vllm/sweep_depth \
-TEACHER=meta-llama/Llama-3.1-8B \
-DEPTHS="4 6 8 10 12" \
-GAMMA=4 NUM_EVAL_SEQS=100 EPOCHS=3 \
-bash scripts/sweep_draft_depth.sh
-```
-
-The sweep is idempotent — checkpoints and JSON eval outputs are written
-per-depth, and re-running picks up where it stopped.
+Run the distillation and evaluation modules directly in your own orchestration
+environment. The sweep is idempotent: checkpoints and JSON eval outputs are
+written per-depth, and re-running can pick up from existing outputs.
 
 ## Files
 
-- `scripts/sweep_draft_depth.sh` — driver script.
-- `scripts/slurm_sweep_depth.sbatch` — SLURM submission for CARC.
 - `mini_vllm/distill/train_distill.py` — KL+CE distillation loop.
 - `mini_vllm/distill/eval_acceptance.py` — α measurement (writes JSON).
 - `mini_vllm/distill/analyze_sweep.py` — aggregates JSON, computes Leviathan

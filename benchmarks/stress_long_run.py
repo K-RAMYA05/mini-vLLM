@@ -21,7 +21,11 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--num-gpu-blocks", type=int, default=8192)
     parser.add_argument("--num-cpu-blocks", type=int, default=0)
-    parser.add_argument("--prefill-backend", default="flash")
+    parser.add_argument(
+        "--prefill-backend",
+        default="flash",
+        choices=["auto", "flash", "flash2", "flash3", "flash_attn", "mem_efficient", "math"],
+    )
     args = parser.parse_args()
 
     cfg = EngineConfig(

@@ -1,6 +1,6 @@
 """HumanEval pass@1 quality evaluation across optimization configurations.
 
-Demonstrates that mini_vllm's optimizations (GPTQ, int8 KV, speculative
+Demonstrates that mini_vllm's optimizations (GPTQ, int8 KV, lookahead
 decoding) preserve generation quality. Every speed claim should come paired
 with a quality claim — otherwise it's not a real comparison.
 
@@ -17,12 +17,11 @@ Configs swept by default:
   - mini-vllm-int8kv        (+ int8 KV cache)
   - mini-vllm-gptq8         (+ GPTQ 8-bit weights)
   - mini-vllm-gptq4         (+ GPTQ 4-bit weights)
-  - mini-vllm-spec          (+ speculative decoding, requires --draft)
+  - mini-vllm-lookahead     (+ lookahead decoding)
 
 Usage:
     python benchmarks/eval_humaneval.py \\
         --model meta-llama/Llama-3.1-8B \\
-        --draft /path/to/draft/final \\
         --configs vllm-reference mini-vllm-baseline mini-vllm-int8kv mini-vllm-gptq8 \\
         --json-out results/quality_eval.json \\
         --markdown-out results/quality_eval.md
@@ -158,7 +157,7 @@ def gen_with_mini_vllm(problems: dict, model: str,
 
 
 # Registry: config_name -> generator function
-def make_generators(model: str, draft: Optional[str]) -> Dict[str, Callable[[dict], List[dict]]]:
+def make_generators(model: str) -> Dict[str, Callable[[dict], List[dict]]]:
     gens: Dict[str, Callable[[dict], List[dict]]] = {
         "vllm-reference": lambda probs: gen_with_vllm(probs, model),
         "mini-vllm-baseline": lambda probs: gen_with_mini_vllm(probs, model, {}),
@@ -171,15 +170,10 @@ def make_generators(model: str, draft: Optional[str]) -> Dict[str, Callable[[dic
         "mini-vllm-gptq4": lambda probs: gen_with_mini_vllm(
             probs, model, {"use_quantization": True, "quant_bits": 4}
         ),
+        "mini-vllm-lookahead": lambda probs: gen_with_mini_vllm(
+            probs, model, {"enable_lookahead_decoding": True, "lookahead_num_slots": 4}
+        ),
     }
-    if draft:
-        gens["mini-vllm-spec"] = lambda probs: gen_with_mini_vllm(
-            probs, model, {
-                "use_speculative": True,
-                "draft_model_name_or_path": draft,
-                "spec_num_draft_tokens": 4,
-            }
-        )
     return gens
 
 
@@ -211,8 +205,8 @@ def render_markdown(out: EvalOutput) -> str:
     lines.append("- GPTQ 4-bit typically loses 1–3 problems vs. fp16 (consistent with "
                  "published 4-bit quality trade-off).")
     lines.append("- int8 KV cache should be essentially lossless at this scale.")
-    lines.append("- Speculative decoding with greedy sampling MUST match the baseline "
-                 "exactly — rejection sampling at T=0 is deterministic.")
+    lines.append("- Lookahead decoding with greedy sampling should preserve the baseline "
+                 "token stream exactly; if it diverges, the multi-substep loop is wrong.")
     return "\n".join(lines)
 
 
@@ -224,8 +218,6 @@ def render_markdown(out: EvalOutput) -> str:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="meta-llama/Llama-3.1-8B")
-    p.add_argument("--draft", default=None,
-                   help="Path to distilled draft (enables mini-vllm-spec config).")
     p.add_argument("--configs", nargs="+", default=[
         "vllm-reference",
         "mini-vllm-baseline",
@@ -245,12 +237,12 @@ def main():
         problems = {k: problems[k] for k in keys}
     print(f"Loaded {len(problems)} HumanEval problems")
 
-    generators = make_generators(args.model, args.draft)
+    generators = make_generators(args.model)
     out = EvalOutput(model=args.model, configs=args.configs)
 
     for cfg_name in args.configs:
         if cfg_name not in generators:
-            print(f"\n=== SKIP {cfg_name}: not registered (check --draft if it's a spec config)")
+            print(f"\n=== SKIP {cfg_name}: not registered")
             continue
         print(f"\n=== Running {cfg_name} ===")
         t0 = time.perf_counter()

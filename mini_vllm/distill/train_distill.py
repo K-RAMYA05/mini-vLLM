@@ -1,25 +1,26 @@
-"""Train a draft model via layer-pruning + distillation.
+"""Train a draft model via init-from-pretrained + distillation.
 
 Pipeline
 --------
-1. Load teacher (Llama-3.1-8B).
-2. Layer-prune to num_keep layers (default 8) -> student.
-3. Train student on pre-generated teacher data with KL + CE loss.
+1. Initialize the student from a small pretrained model that shares the
+   teacher's tokenizer (e.g. meta-llama/Llama-3.2-1B, which uses the same
+   128k Llama-3 vocab as Llama-3.1-8B).
+2. Train the student on pre-generated teacher data with KL + CE loss.
 
-The teacher isn't used at training time — we've already run it to produce
+The teacher isn't loaded at training time — we've already run it to produce
 top-k logits per token (see generate_teacher_data.py). This decouples the
-expensive forward pass from the training loop and lets us do many
-student epochs without re-running the teacher.
+expensive forward pass from the training loop and lets us do many student
+epochs without re-running the teacher.
 
 Usage:
     python -m mini_vllm.distill.train_distill \\
         --teacher meta-llama/Llama-3.1-8B \\
+        --init-from-pretrained meta-llama/Llama-3.2-1B \\
         --data-dir ./distill_data \\
-        --num-keep-layers 8 \\
-        --output-dir ./outputs/llama-3.1-8b-draft-8layer \\
-        --epochs 3 \\
-        --batch-size 8 \\
-        --lr 3e-4
+        --output-dir ./outputs/llama-3.1-8b-draft-llama32-1b \\
+        --epochs 2 \\
+        --batch-size 16 \\
+        --lr 1e-4
 """
 from __future__ import annotations
 
@@ -33,29 +34,34 @@ from torch.utils.data import DataLoader
 
 from mini_vllm.distill.dataset import DistillDataset, collate_distill
 from mini_vllm.distill.distill_loss import DistillConfig, distillation_loss
-from mini_vllm.distill.prune import estimate_param_count, prune_llama_to_n_layers
 
 
-def build_student(teacher_path: str, num_keep: int, dtype: torch.dtype, device: str):
+def build_student(
+    teacher_path: str,
+    init_from_pretrained: str,
+    dtype: torch.dtype,
+    device: str,
+):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(teacher_path)
-    teacher = AutoModelForCausalLM.from_pretrained(
-        teacher_path, torch_dtype=dtype
-    ).to(device).eval()
 
-    print(f"Teacher: {teacher.config.num_hidden_layers} layers, "
-          f"{sum(p.numel() for p in teacher.parameters()) / 1e6:.0f}M params")
-
-    student, keep_idx = prune_llama_to_n_layers(teacher, num_keep=num_keep)
-    print(f"Student: {student.config.num_hidden_layers} layers "
-          f"(kept teacher layers {keep_idx}), "
-          f"{sum(p.numel() for p in student.parameters()) / 1e6:.0f}M params")
-
-    # Free the teacher — training only needs the student and pre-computed data.
-    del teacher
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
+    student_tokenizer = AutoTokenizer.from_pretrained(init_from_pretrained)
+    if student_tokenizer.vocab_size != tokenizer.vocab_size:
+        raise ValueError(
+            f"Init model vocab ({student_tokenizer.vocab_size}) must match "
+            f"teacher vocab ({tokenizer.vocab_size}); runtime verification "
+            f"requires identical tokenizers."
+        )
+    student = AutoModelForCausalLM.from_pretrained(
+        init_from_pretrained, torch_dtype=dtype
+    ).to(device)
+    print(
+        f"Student: initialized from {init_from_pretrained}, "
+        f"{student.config.num_hidden_layers} layers, "
+        f"hidden={student.config.hidden_size}, "
+        f"{sum(p.numel() for p in student.parameters()) / 1e6:.0f}M params"
+    )
     return student, tokenizer
 
 
@@ -64,7 +70,10 @@ def train(args):
     dtype = torch.float16 if device == "cuda" else torch.float32
 
     student, tokenizer = build_student(
-        args.teacher, args.num_keep_layers, dtype=dtype, device=device
+        args.teacher,
+        init_from_pretrained=args.init_from_pretrained,
+        dtype=dtype,
+        device=device,
     )
     # For training, we want fp32 master weights even with fp16 storage.
     # Use bfloat16 if your GPU supports it — avoids the mixed-precision loss scaler.
@@ -192,7 +201,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--teacher", default="meta-llama/Llama-3.1-8B")
     p.add_argument("--data-dir", required=True)
-    p.add_argument("--num-keep-layers", type=int, default=8)
+    p.add_argument(
+        "--init-from-pretrained",
+        default="meta-llama/Llama-3.2-1B",
+        help=(
+            "HF id or local path of a pretrained model to use as the student "
+            "initializer. Vocab must match the teacher's."
+        ),
+    )
     p.add_argument("--output-dir", default="./outputs/llama-3.1-8b-draft-8layer")
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=8)

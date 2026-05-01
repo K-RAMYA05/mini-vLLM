@@ -1,15 +1,12 @@
 """Draft-model distillation pipeline.
 
-Produces a smaller draft model from Llama-3.1-8B by:
-  1. Layer-pruning the target to keep a shortlist of its layers.
-  2. Distilling the pruned model via KL-divergence on the target's output
-     distribution, optionally blended with ground-truth CE.
+Initializes a small pretrained student (e.g. meta-llama/Llama-3.2-1B) and
+distills it against a larger teacher's top-k logits via KL + CE loss.
 
-The draft shares the target's tokenizer (zero-cost, by construction) and
-its architectural conventions (RoPE dims, RMSNorm, GQA config) so it slots
-straight into SpeculativeExecutor.
+The student must share the teacher's tokenizer (zero-cost when both are from
+the Llama-3 family — same 128k vocab) so it slots straight into
+SpeculativeExecutor.
 """
-from mini_vllm.distill.prune import prune_llama_to_n_layers
 from mini_vllm.distill.distill_loss import distillation_loss
 
-__all__ = ["prune_llama_to_n_layers", "distillation_loss"]
+__all__ = ["distillation_loss"]

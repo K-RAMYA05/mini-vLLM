@@ -93,6 +93,22 @@ def test_write_prefill_and_read_back():
     assert torch.equal(got_v, values[5])
 
 
+def test_write_prefill_with_nonzero_start_position():
+    cache = KVCache(
+        num_layers=1, num_kv_heads=2, head_dim=3,
+        num_blocks=6, block_size=4, dtype=torch.float32, device="cpu",
+    )
+    bt = BlockTable([2, 4, 5])
+    keys = torch.arange(4 * 2 * 3, dtype=torch.float32).view(4, 2, 3)
+    values = -keys
+
+    cache.write_prefill(layer_idx=0, block_table=bt, start_pos=3, keys=keys, values=values)
+    read_keys, read_values = cache.read_tokens(layer_idx=0, block_table=bt, end_pos=7)
+
+    torch.testing.assert_close(read_keys[3:], keys)
+    torch.testing.assert_close(read_values[3:], values)
+
+
 def test_build_block_tables_tensor_pads_correctly():
     bts = [BlockTable(), BlockTable(), BlockTable()]
     bts[0].append(2); bts[0].append(3)
@@ -126,3 +142,99 @@ def test_kv_cache_swaps_blocks_to_cpu_and_back():
     assert cache.cpu_allocator.num_free == 2
     block_id, offset = cache.logical_to_physical(bt, 1)
     torch.testing.assert_close(cache.key_cache[0, block_id, :, offset, :], keys[1])
+
+
+def test_int8_kv_cache_preserves_scales_across_swap_round_trip():
+    cache = KVCache(
+        num_layers=1, num_kv_heads=1, head_dim=4,
+        num_blocks=2, num_cpu_blocks=2, block_size=2,
+        dtype=torch.float32, device="cpu", kv_cache_dtype="int8",
+    )
+    bt = BlockTable()
+    bt.append(cache.allocator.allocate())
+    bt.append(cache.allocator.allocate())
+    keys = torch.tensor(
+        [
+            [[0.5, -1.0, 1.5, -2.0]],
+            [[2.5, -3.0, 3.5, -4.0]],
+            [[4.5, -5.0, 5.5, -6.0]],
+            [[6.5, -7.0, 7.5, -8.0]],
+        ],
+        dtype=torch.float32,
+    )
+    values = keys * -0.25
+
+    cache.write_prefill(0, bt, 0, keys, values)
+    expected_key_scales = cache.key_scales[:, bt.as_list()].clone()
+    expected_value_scales = cache.value_scales[:, bt.as_list()].clone()
+
+    cache.swap_out(bt)
+    cache.swap_in(bt)
+
+    actual_blocks = bt.as_list()
+    torch.testing.assert_close(cache.key_scales[:, actual_blocks], expected_key_scales)
+    torch.testing.assert_close(cache.value_scales[:, actual_blocks], expected_value_scales)
+    read_keys, read_values = cache.read_tokens(0, bt, end_pos=4)
+    torch.testing.assert_close(read_keys, keys, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(read_values, values, atol=0.05, rtol=0.05)
+
+
+def test_int8_read_tokens_vectorized_round_trip_with_offset_start():
+    cache = KVCache(
+        num_layers=1, num_kv_heads=2, head_dim=4,
+        num_blocks=4, block_size=2, dtype=torch.float32, device="cpu", kv_cache_dtype="int8",
+    )
+    bt = BlockTable([cache.allocator.allocate(), cache.allocator.allocate(), cache.allocator.allocate()])
+    prefix_keys = torch.tensor(
+        [
+            [[0.25, -0.5, 0.75, -1.0], [1.25, -1.5, 1.75, -2.0]],
+            [[2.25, -2.5, 2.75, -3.0], [3.25, -3.5, 3.75, -4.0]],
+            [[4.25, -4.5, 4.75, -5.0], [5.25, -5.5, 5.75, -6.0]],
+        ],
+        dtype=torch.float32,
+    )
+    prefix_values = prefix_keys * -0.125
+
+    cache.write_prefill(0, bt, 1, prefix_keys, prefix_values)
+    read_keys, read_values = cache.read_tokens(0, bt, end_pos=4)
+
+    torch.testing.assert_close(read_keys[1:], prefix_keys, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(read_values[1:], prefix_values, atol=0.05, rtol=0.05)
+
+
+def test_write_decode_batch_writes_one_token_per_sequence():
+    cache = KVCache(
+        num_layers=1, num_kv_heads=1, head_dim=2,
+        num_blocks=4, block_size=2, dtype=torch.float32, device="cpu",
+    )
+    bt0 = BlockTable([cache.allocator.allocate()])
+    bt1 = BlockTable([cache.allocator.allocate(), cache.allocator.allocate()])
+    block_tables = build_block_tables_tensor([bt0, bt1], max_num_blocks=2, device="cpu")
+    context_lens = torch.tensor([1, 3], dtype=torch.int32)
+    keys = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]], dtype=torch.float32)
+    values = -keys
+
+    cache.write_decode_batch(0, block_tables, context_lens, keys, values)
+
+    b0, o0 = cache.logical_to_physical(bt0, 0)
+    b1, o1 = cache.logical_to_physical(bt1, 2)
+    torch.testing.assert_close(cache.key_cache[0, b0, :, o0, :], keys[0])
+    torch.testing.assert_close(cache.value_cache[0, b0, :, o0, :], values[0])
+    torch.testing.assert_close(cache.key_cache[0, b1, :, o1, :], keys[1])
+    torch.testing.assert_close(cache.value_cache[0, b1, :, o1, :], values[1])
+
+
+def test_memory_stats_reports_kv_capacity():
+    cache = KVCache(
+        num_layers=2, num_kv_heads=2, head_dim=4,
+        num_blocks=8, block_size=4, dtype=torch.float32, device="cpu",
+        num_cpu_blocks=2,
+    )
+
+    stats = cache.memory_stats()
+
+    assert stats["gpu_kv_tokens_total"] == 32
+    assert stats["gpu_kv_tokens_free"] == 32
+    assert stats["cpu_kv_tokens_total"] == 8
+    assert stats["bytes_per_kv_token"] > 0
+    assert stats["bytes_per_kv_block"] == stats["bytes_per_kv_token"] * cache.block_size

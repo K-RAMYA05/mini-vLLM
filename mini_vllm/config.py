@@ -28,10 +28,9 @@ class EngineConfig:
     # Swap space on CPU for preemption. 0 disables swapping.
     num_cpu_blocks: int = 0
     # 'auto' = match model dtype (fp16/bf16). 'int8' = symmetric per-token
-    # quantization with one fp16 scale per (block, kv_head, slot). ~50%
-    # memory saving at rest, enabling ~2x longer context. Quantization error
-    # is bounded by max-abs of each row.
-    kv_cache_dtype: str = "auto"  # auto | int8
+    # quantization with one fp16 scale per (block, kv_head, slot). 'fp8' is
+    # Hopper-only E4M3 storage plus the same per-token scales.
+    kv_cache_dtype: str = "auto"  # auto | int8 | fp8
 
     # ---- Scheduler / continuous batching ----
     max_num_seqs: int = 256                # max concurrent sequences
@@ -44,6 +43,9 @@ class EngineConfig:
     # LRU is fine for single-tenant. LFU is much better when one popular
     # system prompt is repeatedly hit while many one-shot prompts churn.
     prefix_cache_eviction: str = "lru"  # lru | lfu
+    admission_window_size: int = 32
+    scheduler_age_bias: float = 0.25
+    max_waiting_age_before_decode_priority_s: float = 0.050
 
     # ---- Multi-GPU placeholders ----
     # Real TP/PP requires sharded weight loading, distributed collectives, and
@@ -51,43 +53,44 @@ class EngineConfig:
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
 
-    # ---- Speculative decoding ----
-    use_speculative: bool = False
-    draft_model_name_or_path: Optional[str] = None
-    spec_num_draft_tokens: int = 4          # γ: fixed tokens-per-step
-    # Adaptive γ: per-seq EWMA of recent acceptance fraction picks γ in
-    # [spec_gamma_min, spec_gamma_max]. spec_num_draft_tokens is used as
-    # the warm-start γ for newly-seen sequences.
-    spec_adaptive_gamma: bool = False
-    spec_gamma_min: int = 1
-    spec_gamma_max: int = 8
-    spec_gamma_ewma_alpha: float = 0.3      # weight of latest observation
+    # ---- Lookahead decoding ----
+    # Decode-only steps can advance the resident batch for several substeps
+    # before handing control back to the scheduler. This removes repeated
+    # Python/scheduler overhead without introducing a draft model.
+    enable_lookahead_decoding: bool = False
+    lookahead_num_slots: int = 4
 
     # ---- Quantization ----
     use_quantization: bool = False
-    quant_method: str = "gptq"              # only gptq supported
+    quant_method: str = "gptq"              # gptq | awq | fp8
     quant_bits: int = 8                     # 4 or 8
     quant_group_size: int = 128
+    lora_adapters: tuple[str, ...] = field(default_factory=tuple)
 
     # ---- Kernels ----
     use_triton_attention: bool = True       # False -> fallback reference kernel
-    prefill_attention_backend: str = "auto" # auto | flash | flash_attn | mem_efficient | math
+    prefill_attention_backend: str = "auto" # auto | flash | flash2 | flash3 | flash_attn | mem_efficient | math
+
+    # ---- Sliding window attention ----
+    # When set, attention attends only to the last `sliding_window` tokens.
+    # None disables it and the model uses full causal context. The flag is
+    # read at runtime; weights and architecture are unchanged.
+    sliding_window: Optional[int] = None
+
+    # ---- CUDA graphs (decode capture) ----
+    # When True, decode-only forward passes are captured into CUDA graphs at
+    # a small set of padded batch sizes. Replays eliminate Python launch
+    # overhead and typically lift decode tok/s by 1.3-2x on small models.
+    # Decode-only forwards can be captured and replayed at a small set of
+    # padded batch sizes. Prefill remains eager.
+    enable_cuda_graphs: bool = False
+    cuda_graph_batch_sizes: tuple = (1, 2, 4, 8, 16, 32)
 
     # ---- Misc ----
     seed: int = 0
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
-        if self.use_speculative and self.draft_model_name_or_path is None:
-            raise ValueError("draft_model_name_or_path required when use_speculative=True")
-        if self.spec_adaptive_gamma:
-            if not (1 <= self.spec_gamma_min <= self.spec_gamma_max):
-                raise ValueError(
-                    f"spec_gamma_min ({self.spec_gamma_min}) must be in "
-                    f"[1, spec_gamma_max] ({self.spec_gamma_max})"
-                )
-            if not (0.0 < self.spec_gamma_ewma_alpha <= 1.0):
-                raise ValueError("spec_gamma_ewma_alpha must be in (0, 1]")
         if self.block_size not in (4, 8, 16, 32):
             # The Triton kernel is written assuming power-of-two block sizes
             # that fit nicely in a warp. 4 is allowed for tests/small-batch
@@ -100,25 +103,46 @@ class EngineConfig:
         if self.prefill_attention_backend not in (
             "auto",
             "flash",
+            "flash2",
+            "flash3",
             "flash_attn",
             "mem_efficient",
             "math",
         ):
             raise ValueError(
                 "prefill_attention_backend must be one of "
-                "auto, flash, flash_attn, mem_efficient, math"
+                "auto, flash, flash2, flash3, flash_attn, mem_efficient, math"
             )
         if self.tensor_parallel_size < 1 or self.pipeline_parallel_size < 1:
             raise ValueError("parallel sizes must be >= 1")
-        if self.enable_chunked_prefill:
-            raise NotImplementedError("chunked prefill is not implemented yet")
+        if self.enable_chunked_prefill and self.max_prefill_chunk_tokens < 1:
+            raise ValueError("max_prefill_chunk_tokens must be >= 1 when chunked prefill is on")
+        if self.enable_lookahead_decoding and self.lookahead_num_slots < 2:
+            raise ValueError("lookahead_num_slots must be >= 2 when lookahead decoding is on")
+        if self.sliding_window is not None and self.sliding_window < 1:
+            raise ValueError("sliding_window must be >= 1 when set")
+        if self.quant_method not in ("gptq", "awq", "fp8"):
+            raise ValueError(f"quant_method must be 'gptq', 'awq', or 'fp8' (got {self.quant_method})")
+        if any("=" not in item for item in self.lora_adapters):
+            raise ValueError("lora_adapters entries must use name=path format")
+        if self.enable_cuda_graphs:
+            if not self.cuda_graph_batch_sizes:
+                raise ValueError("cuda_graph_batch_sizes must be non-empty when enable_cuda_graphs=True")
+            if any(int(x) < 1 for x in self.cuda_graph_batch_sizes):
+                raise ValueError("cuda_graph_batch_sizes entries must be >= 1")
         if self.prefix_cache_max_entries < 0:
             raise ValueError("prefix_cache_max_entries must be >= 0")
         if self.prefix_cache_eviction not in ("lru", "lfu"):
             raise ValueError(
                 f"prefix_cache_eviction must be 'lru' or 'lfu' (got {self.prefix_cache_eviction})"
             )
-        if self.kv_cache_dtype not in ("auto", "int8"):
+        if self.admission_window_size < 1:
+            raise ValueError("admission_window_size must be >= 1")
+        if self.scheduler_age_bias < 0.0:
+            raise ValueError("scheduler_age_bias must be >= 0")
+        if self.max_waiting_age_before_decode_priority_s < 0.0:
+            raise ValueError("max_waiting_age_before_decode_priority_s must be >= 0")
+        if self.kv_cache_dtype not in ("auto", "int8", "fp8"):
             raise ValueError(
-                f"kv_cache_dtype must be 'auto' or 'int8' (got {self.kv_cache_dtype})"
+                f"kv_cache_dtype must be 'auto', 'int8', or 'fp8' (got {self.kv_cache_dtype})"
             )
